@@ -1692,6 +1692,21 @@ class GatewayTurnMixin:
 
     def _hmwa_failed_turn_notice(self, agent_result):
         """Choose retry guidance without assuming completed tool effects can be repeated safely."""
+        if (agent_result.get("auth_failure") or {}).get("provider") == "openai-codex":
+            evidence = agent_result.get("request_persistence") or {}
+            saved = "Your request is saved." if evidence.get("saved") is True else "I couldn't confirm that your request was saved."
+            messages = agent_result.get("messages") or []
+            retry = "/retry is blocked for this failure." if evidence.get("retry_blocked") is True else "Review is required before authorizing another attempt."
+            # A compressed/absent in-memory turn cannot prove that no actions ran.
+            user_idx = agent_result.get("current_turn_user_idx")
+            complete_turn = messages[user_idx:] if (
+                isinstance(user_idx, int) and 0 <= user_idx < len(messages)
+                and messages[user_idx].get("role") == "user"
+            ) else []
+            effects = any(m.get("role") in {"tool", "function"} or m.get("tool_calls") for m in complete_turn)
+            if evidence.get("saved") is True and evidence.get("current") is True and evidence.get("tools_recorded") is False and complete_turn and not effects:
+                return saved + " No tools are recorded on this attempt. Review the saved request after access is restored. " + retry
+            return saved + " Tool effects may be partial or unknown. Review the request and any effects before authorizing another attempt. " + retry
         from gateway.media_repair import _current_turn_messages
         # Compression during the failed turn can move the slice boundary; the shared helper falls
         # back to the last user row so tool evidence is not silently dropped.
@@ -1842,6 +1857,9 @@ class GatewayTurnMixin:
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+        codex_failure = (agent_result.get("auth_failure") or {}).get("provider") == "openai-codex"
+        if codex_failure:
+            await store.note_uncertain_auth_failure(sid)
 
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
@@ -1869,7 +1887,17 @@ class GatewayTurnMixin:
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
-                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+                if codex_failure:
+                    agent_result["request_persistence"] = await store.failed_request_evidence(sid, str(event.message_id or ""))
+                    evidence = agent_result["request_persistence"]
+                    evidence["retry_blocked"] = True
+                    evidence["boundary_saved"] = await store.close_failed_auth_turn(
+                        sid, evidence.get("row_id"), self._hmwa_failed_turn_notice(agent_result),
+                        input_owner=prepared.persistence_owner, platform_message_id=str(event.message_id or ""),
+                        expected_messages=agent_messages,
+                    )
+                else:
+                    await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
@@ -1900,6 +1928,9 @@ class GatewayTurnMixin:
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
+
+                if agent_result.get("completed") is True and not agent_result.get("interrupted"):
+                    await store.complete_codex_auth_turn(sid, prepared.persistence_owner)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(
@@ -2205,7 +2236,10 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
-                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event),
+                    **({"restart_resume": True} if event.internal and not str(event.text or "").strip()
+                       and getattr(session_entry, "resume_pending", False) else {}),
+                },
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -2225,6 +2259,10 @@ class GatewayTurnMixin:
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
             await self._hmwa_stop_typing_for_turn(event, source)
+            if agent_result.get("auth_resume_blocked") is True:
+                # No new input was executed: retain the original failed boundary and do
+                # not turn a refused restart into a fresh resumable transcript row.
+                return None
 
             if not self._is_session_run_current(_quick_key, run_generation):
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
@@ -2246,7 +2284,7 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
-            if agent_failed_early and not is_context_overflow_failure:
+            if agent_failed_early and not is_context_overflow_failure and not agent_result.get("auth_failure"):
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
@@ -2258,6 +2296,8 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            if agent_failed_early and (agent_result.get("auth_failure") or {}).get("provider") == "openai-codex":
+                response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,

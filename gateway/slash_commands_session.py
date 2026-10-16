@@ -396,6 +396,11 @@ class GatewaySessionCommandsMixin:
                               if user_originated_turn_view(history[i]) is not None), None)
         if last_user_idx is None:
             return t("gateway.retry.no_previous")
+        if any((m.get("display_metadata") or {}).get("codex_auth_failure") is True
+               for m in history[last_user_idx + 1:]):
+            # Plain /retry selects the latest turn and has no pinned-input CAS. Keep this
+            # failed request intact until an operator reviews effects and authorizes replay.
+            return "Cannot retry this Codex authentication failure safely. Review the saved request and any tool effects after restoring access before authorizing another attempt."
         # Resolve text + scaffold-preserving prefix BEFORE any write; messaging retries cannot
         # reconstruct attachments, so media/unknown content is rejected with the session untouched.
         try:
@@ -413,7 +418,7 @@ class GatewaySessionCommandsMixin:
                 # Plain turns keep the existing rewrite path below; #84078 owns its separate
                 # archive_dropped/prefix-CAS semantics.
                 rewind_result = await self.async_session_store.rewind_session(
-                    session_entry.session_id, 1, require_retryable_composite=True)
+                    session_entry.session_id, 1, require_retryable_composite=True, retry_expected_history=history)
             except ValueError as exc:
                 return t("gateway.retry.unsafe", error=exc)
             if rewind_result is None:
@@ -421,7 +426,8 @@ class GatewaySessionCommandsMixin:
             last_user_msg = rewind_result["target_text"]
         # active_only preserves the active=0/compacted=1 archive left by in-place compaction.
         elif not await self.async_session_store.rewrite_transcript(
-            session_entry.session_id, truncated, active_only=True, reject_active_turn_lease=True):
+            session_entry.session_id, truncated, active_only=True, reject_active_turn_lease=True,
+            retry_expected_history=history):
             return t("gateway.retry.failed_unchanged")
         session_entry.last_prompt_tokens = 0  # transcript was truncated
         self._record_model_friction("retry", source, session_entry.session_id)

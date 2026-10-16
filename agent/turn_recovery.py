@@ -404,7 +404,14 @@ def _refresh_credentials_after_401(
         and not _retry.codex_auth_retry_attempted
     ):
         _retry.codex_auth_retry_attempted = True
-        if agent._try_refresh_codex_client_credentials(force=True):
+        from agent.codex_auth_recovery import refresh_outcome
+        agent._codex_refresh_outcome = refresh_outcome("unknown", resolver_invoked=True, force_requested=True)
+        refreshed = agent._try_refresh_codex_client_credentials(force=True)
+        _retry.codex_refresh_outcome = dict(agent._codex_refresh_outcome)
+        logger.info("Codex auth recovery session=%s request=%s outcome=%s",
+                    getattr(agent, "session_id", None), getattr(agent, "_current_api_request_id", None),
+                    _retry.codex_refresh_outcome)
+        if refreshed:
             _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
             agent._buffer_vprint(f"🔐 {_label} auth refreshed after 401. Retrying request...")
             return True
@@ -973,7 +980,7 @@ def nonretryable_client_error_result(
     agent: Any, api_error: Exception, classified: Any, *, status_code: Optional[int],
     api_kwargs: Any, api_messages: Any, messages: List[Dict[str, Any]], conversation_history: Any,
     api_call_count: int, approx_tokens: int, provider: Any, base_url: Any, model: Any,
-    delivered: str = "",
+    delivered: str = "", retry_state: Optional[TurnRetryState] = None,
 ) -> Dict[str, Any]:
     """Terminal path for a non-retryable 4xx once fallback is exhausted: debug dump, flush
     the retry trace, print auth / billing / content-policy / TLS guidance, persist (skipped
@@ -981,16 +988,27 @@ def nonretryable_client_error_result(
     # Result/guidance helpers stay in the loop module (tests import + patch them there).
     from agent.conversation_loop import _billing_failure_result, _content_policy_blocked_result
 
-    if api_kwargs is not None:
+    from agent.codex_auth_recovery import codex_auth_failure, codex_auth_notice
+    auth_failure = None
+    if provider == "openai-codex" and classified.is_auth:
+        auth_failure = codex_auth_failure(
+            api_error, retry_state.codex_refresh_outcome if retry_state else None,
+            fallback_configured=bool(agent._fallback_chain),
+            fallback_attempted=bool(retry_state and retry_state.auth_failover_attempted),
+        )
+    if api_kwargs is not None and auth_failure is None:
         agent._dump_api_request_debug(api_kwargs, reason="non_retryable_client_error", error=api_error)
     # Terminal — flush buffered context so the user sees what was tried before the abort.
     agent._flush_status_buffer()
     # Summarize once: Cloudflare/proxy HTML pages and raw provider bodies must be
     # collapsed here or they leak verbatim via the ``error`` field.
-    _nonretryable_summary = agent._summarize_api_error(api_error)
+    _nonretryable_summary = auth_failure["kind"] if auth_failure else agent._summarize_api_error(api_error)
     _plabel = provider_label_for(provider)
     _label = _NONRETRYABLE_LABELS.get(classified.reason, f"{_plabel} rejected the request and retrying won't help")
-    agent._emit_diagnostic_status(f"❌ {_label}: {_nonretryable_summary}")
+    if auth_failure:
+        agent._emit_status_kind("terminal_auth", codex_auth_notice(auth_failure), origin="codex_auth_failure")
+    else:
+        agent._emit_diagnostic_status(f"❌ {_label}: {_nonretryable_summary}")
     # The endpoint/status trace is developer detail: verbose only (the log has it always).
     if getattr(agent, "verbose_logging", False):
         _vlines(
@@ -1004,7 +1022,7 @@ def nonretryable_client_error_result(
         # A free-tier gate or a wrong-host refusal: the way forward is a sign-in or another
         # provider, never the key/credits advice below.
         _vlines(agent, f"   💡 {_welcome_hint}")
-    elif classified.is_auth or classified.reason == FailoverReason.billing:
+    elif not auth_failure and (classified.is_auth or classified.reason == FailoverReason.billing):
         _print_nonretryable_auth_guidance(
             agent, classified, status_code=status_code, provider=provider, base_url=base_url, model=model
         )
@@ -1012,7 +1030,7 @@ def nonretryable_client_error_result(
         _vlines(agent, f"   💡 Model '{model}' isn't available on {_plabel}. Pick another with /model.")
         if _prefix_suggestion:
             _vlines(agent, f"      Did you mean '{_prefix_suggestion}'? It looks like the vendor prefix is missing.")
-    elif classified.reason not in _NONRETRYABLE_LABELS:
+    elif not auth_failure and classified.reason not in _NONRETRYABLE_LABELS:
         _vlines(agent, f"   💡 Fix: pick another model (/model), or check `{display_hermes_home()}/logs/agent.log`.")
     # A WAF/CDN block (#53099, #70566): the key never reached the provider; the usual cause
     # is the SDK User-Agent, which the per-provider extra_headers override.
@@ -1045,7 +1063,11 @@ def nonretryable_client_error_result(
             "      • Self-signed local endpoint (llama.cpp, LM Studio, vLLM)? Use http://",
             "        for localhost, or add the server's cert to your trust store.",
         )
-    logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
+    if auth_failure:
+        logger.warning("Codex terminal auth session=%s request=%s failure=%s",
+                       getattr(agent, "session_id", None), getattr(agent, "_current_api_request_id", None), auth_failure)
+    else:
+        logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
     # Skip persistence on likely context-overflow (400 + large session): persisting the
     # failed message grows the session and repeats the failure.
     # Persisting the failed user message would make the session even larger, causing the same failure on the
@@ -1075,7 +1097,7 @@ def nonretryable_client_error_result(
         # Every surface reads final_response; the CLI hint lines above never reach chat.
         _final_response = nonretryable_copy(
             classified, provider=provider, model=model, summary=_nonretryable_summary,
-            prefix_suggestion=_prefix_suggestion,
+            prefix_suggestion=_prefix_suggestion, auth_failure=auth_failure,
         )
     # Same verdict fields as the max-retries path: without them the UI descriptor
     # (agent/error_surface.py) reads a rejected OAuth token as a retryable
@@ -1088,6 +1110,8 @@ def nonretryable_client_error_result(
         "failure_reason": classified.reason.value,
         "failure_retryable": bool(classified.retryable),
     })
+    if auth_failure:
+        result["auth_failure"] = auth_failure
     if _keep_partial:
         result["partial"] = True
     _stamp_limit_reset(result, agent, api_error)
@@ -1260,7 +1284,12 @@ def log_api_error_attempt(
     and sends readers hunting for a retry bug (#73237)."""
     error_type = type(api_error).__name__
     error_msg = str(api_error).lower()
-    _error_summary = agent._summarize_api_error(api_error)
+    codex_auth = getattr(agent, "provider", None) == "openai-codex" and status_code in {401, 403}
+    if codex_auth:
+        from agent.codex_auth_recovery import codex_auth_failure
+        _error_summary = codex_auth_failure(api_error)["kind"]
+    else:
+        _error_summary = agent._summarize_api_error(api_error)
     _attempt = f"attempt {retry_count}/{max_retries}" + ("" if retryable else ", not retryable")
     logger.warning(
         "API call failed (%s) error_type=%s %s summary=%s",
@@ -1279,7 +1308,7 @@ def log_api_error_attempt(
             f"   🔌 {error_type}{_status_code_str}  Provider: {_provider}  Model: {_model}",
             f"   🌐 Endpoint: {_base}",
         )
-        if status_code and status_code < 500:
+        if status_code and status_code < 500 and not codex_auth:
             _err_body = getattr(api_error, "body", None)
             _err_body_str = str(_err_body)[:300] if _err_body else None
             if _err_body_str:

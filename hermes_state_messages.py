@@ -805,7 +805,8 @@ class SessionMessagesMixin:
         return rewritten
 
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]], active_only: bool = False,
-        archive_dropped: bool = False, reject_active_turn_lease: bool = False) -> None:
+        archive_dropped: bool = False, reject_active_turn_lease: bool = False,
+        retry_expected_history: Optional[List[Dict[str, Any]]] = None) -> None:
         """Atomically replace a session's messages (/retry, /undo, /compress). DESTRUCTIVE by default (rows
         DELETEd, leave FTS). ``active_only`` spares soft-archived rows (needed with in-place compaction).
         ``archive_dropped`` SOFT-archives live rows rewind-style: what rewind/edit/regenerate must use, since
@@ -831,6 +832,9 @@ class SessionMessagesMixin:
                     conn, session_id, None, reject_active_turn_lease=True, reject_active_compression_lock=True)
             elif _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()):
                 raise CompressionSessionClosedError(session_id)
+            if retry_expected_history is not None:
+                from hermes_state_retry import validate_retry_history
+                validate_retry_history(self, conn, session_id, retry_expected_history)
             kept = kept_tool_calls = 0
             if archive_dropped:
                 # Only the first len(messages)+1 live rows matter: the prefix to match plus the row whose
@@ -1605,10 +1609,58 @@ class SessionMessagesMixin:
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)})"
             f"{active_clause} ORDER BY id", tuple(session_ids))
 
+    def assert_no_pending_codex_auth(self, session_id: str) -> None:
+        """Metadata-only live admission check; callers must already own the turn lease."""
+        from hermes_state_retry import validate_history_auth_state
+        rows = self._read_all(
+            "SELECT role,display_metadata FROM messages WHERE session_id=? AND active=1 "
+            "AND compacted=0 AND display_metadata IS NOT NULL", (session_id,))
+        validate_history_auth_state(rows, reject_pending=True)
+
+    def read_turn_admission(self, session_id: str, holder: str, *, reload_history: bool = False,
+                            allow_missing: bool = False, reject_auth_failure: bool = False):
+        """Resolve, verify ownership and validate execution state in one writer snapshot.
+
+        A route change requires canonical history; an unchanged immediate route
+        only reads metadata, preserving the caller's prepared history identity.
+        Return target, optional history and whether its row exists. A fresh missing
+        row is allowed only under its verified lease, with no orphaned messages.
+        """
+        from hermes_state_retry import resolve_turn_admission_target, validate_history_auth_state
+        def read(conn):
+            key = self._session_turn_lease_key_on_conn(conn, session_id)
+            lease = conn.execute(_TURN_LEASE_ROW_SQL, (key,)).fetchone()
+            if lease is None or lease["holder"] != holder or float(lease["expires_at"]) <= time.time():
+                raise ValueError("turn admission no longer owns the acquired lease")
+            exists = conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if exists is None and allow_missing:
+                if reject_auth_failure:
+                    from hermes_state_retry import CodexAuthResumeBlocked
+                    raise CodexAuthResumeBlocked("Automatic continuation has no durable session")
+                if conn.execute("SELECT 1 FROM messages WHERE session_id=? LIMIT 1", (session_id,)).fetchone():
+                    raise ValueError("turn admission has orphaned transcript rows")
+                return session_id, None, False
+            target = resolve_turn_admission_target(conn, session_id)
+            if self._session_turn_lease_key_on_conn(conn, target) != key:
+                raise ValueError("turn admission continuation does not share the acquired lease")
+            reload = reload_history or target != session_id
+            columns = "*" if reload else "role,display_metadata"
+            rows = conn.execute(f"SELECT {columns} FROM messages WHERE session_id=? AND active=1 "
+                                "AND compacted=0 ORDER BY id", (target,)).fetchall()
+            validate_history_auth_state(rows, reject_pending=True, reject_failure=reject_auth_failure)
+            if reject_auth_failure:
+                from hermes_state_retry import reject_archived_codex_auth_resume
+                reject_archived_codex_auth_resume(conn, target, key)
+            history = self._rows_to_conversation(rows, session_id=target, include_ancestors=False,
+                repair_alternation=True, include_row_ids=True, include_summary_markers=True) if reload else None
+            return target, history, True
+        return self._execute_write(read, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
                                      include_inactive: bool = False, repair_alternation: bool = False,
                                      include_row_ids: bool = False,
-                                     include_compacted: bool = False) -> List[Dict[str, Any]]:
+                                     include_compacted: bool = False,
+                                     reject_pending_codex_auth: bool = False) -> List[Dict[str, Any]]:
         """Load messages in OpenAI format. ``include_compacted`` (deduped display history) is for DISPLAY reads
         only: the model-fed restore must not regrow what compaction summarized away. ``repair_alternation``
         repairs the loaded list for LIVE REPLAY callers (a durable ``user;user`` pair would re-trigger the
@@ -1617,6 +1669,9 @@ class SessionMessagesMixin:
         rows = self._fetch_conversation_rows(
             self._resume_lineage_ids(session_id) if include_ancestors else [session_id],
             self._active_clause(include_inactive, include_compacted), with_session_id=False)
+        if reject_pending_codex_auth:
+            from hermes_state_retry import validate_history_auth_state
+            validate_history_auth_state(rows, reject_pending=True)
         if include_compacted:
             rows = self._dedupe_display_generations(rows)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
@@ -1910,7 +1965,8 @@ class SessionMessagesMixin:
 
     def rewind_to_message(self, session_id: str, target_message_id: int, *, preserve_compaction_handoff: bool = False,
                           expected_active_ids: Optional[List[int]] = None,
-                          expected_target_content: Any = None) -> Dict[str, Any]:
+                          expected_target_content: Any = None,
+                          retry_expected_history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Soft-delete (``active=0``) every message with id >= *target_message_id*, target included (the caller
         pre-fills it as the next prompt). Returns ``{"rewound_count", "target_message", "new_head_id"}``, plus
         ``replacement_message_id`` with ``preserve_compaction_handoff`` (archives a composite summary carrier,
@@ -1921,6 +1977,9 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(
                 conn, session_id, None, reject_active_turn_lease=True, reject_active_compression_lock=True)
+            if retry_expected_history is not None:
+                from hermes_state_retry import validate_retry_history
+                validate_retry_history(self, conn, session_id, retry_expected_history)
             if expected_active_ids is not None:
                 active_rows = conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()
                 if [int(r[0]) for r in active_rows] != expected_active_ids:

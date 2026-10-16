@@ -82,6 +82,7 @@ class TurnFacadeMixin:
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
+                automatic_resume=(persist_user_display_metadata or {}).get("restart_resume") is True,
             )
             if admission.early_result is not None:
                 carry_unadmitted_user_message(

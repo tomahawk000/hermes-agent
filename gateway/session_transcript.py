@@ -466,6 +466,167 @@ class SessionTranscriptMixin:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def failed_request_evidence(self, session_id: str, platform_message_id: str) -> Dict[str, Any]:
+        """Metadata-only proof for this input, never prompt content or auth state.
+
+        One SQLite snapshot binds the active user row to its platform identity and bounds
+        tool evidence at the next user turn. Unknown storage stays unknown, never 'saved'.
+        """
+        unknown = {"saved": False, "tools_recorded": None, "current": False}
+        if not platform_message_id:
+            return unknown
+        session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return unknown
+        try:
+            row = db._read_one("""
+                WITH target AS (
+                    SELECT id FROM messages WHERE session_id=? AND platform_message_id=?
+                    AND role='user' AND active=1 AND compacted=0 ORDER BY id DESC LIMIT 1
+                ), next_user AS (
+                    SELECT MIN(id) AS id FROM messages WHERE session_id=? AND role='user'
+                    AND active=1 AND compacted=0 AND id > (SELECT id FROM target)
+                )
+                SELECT target.id, (SELECT id FROM next_user) IS NULL AS current,
+                    EXISTS(SELECT 1 FROM messages WHERE session_id=? AND active=1 AND compacted=0
+                        AND id > target.id AND id < COALESCE((SELECT id FROM next_user), 9223372036854775807)
+                        AND (role='tool' OR (role='assistant' AND tool_calls IS NOT NULL AND tool_calls != '[]')))
+                        AS tools_recorded
+                FROM target
+            """, (session_id, platform_message_id, session_id, session_id))
+        except Exception:
+            logger.debug("Failed-request evidence unavailable for session %s", session_id)
+            return unknown
+        if row is None:
+            return unknown
+        return {"saved": True, "row_id": row["id"], "tools_recorded": bool(row["tools_recorded"]),
+                "current": bool(row["current"])}
+
+    def note_uncertain_auth_failure(self, session_id: str) -> None:
+        """Block history use until an ownership-pinned failure boundary is durable."""
+        with self._get_transcript_drain_lock():
+            self._uncertain_auth_failures.add(session_id)
+
+    def close_failed_auth_turn(self, session_id: str, user_row_id: int, notice: str, *,
+                               input_owner: Optional[str] = None, platform_message_id: str = "",
+                               expected_messages: Optional[List[Dict[str, Any]]] = None) -> bool:
+        """Close/mark only the pinned failed input, atomically refusing a newer user turn.
+
+        Do not queue a refused/failed write for later: a delayed boundary could close an
+        unrelated turn. This method never rewrites input or authorizes execution.
+        """
+        from hermes_state_messages import _INSERT_MESSAGE_SQL
+        import time
+
+        original_session_id = session_id
+        session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return False
+        def close(conn):
+            db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
+            user = conn.execute("SELECT * FROM messages WHERE session_id=? AND role='user' "
+                                "AND active=1 AND compacted=0 ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+            if not user:
+                return False
+            meta = db._decode_display_metadata(user["display_metadata"]) or {}
+            existing_owner = meta.get("gateway_input_owner")
+            if (input_owner and existing_owner is not None and existing_owner != input_owner) or (
+                platform_message_id and user["platform_message_id"] and user["platform_message_id"] != platform_message_id
+            ):
+                return False
+            target_id = user_row_id
+            if target_id is None:
+                if (input_owner and meta.get("gateway_input_owner") == input_owner) or (
+                    platform_message_id and user["platform_message_id"] == platform_message_id
+                ):
+                    target_id = user["id"]
+                elif expected_messages and existing_owner is None and user["platform_message_id"] is None:
+                    # Legacy inputs lack both identifiers. Require the complete observed
+                    # conversation to match inside this transaction before adopting a row id.
+                    from hermes_state_rewind import _comparison_content
+                    rows = conn.execute("SELECT * FROM messages WHERE session_id=? AND active=1 ORDER BY id",
+                                        (session_id,)).fetchall()
+                    durable = db._rows_to_conversation(rows, session_id=session_id,
+                                                       include_ancestors=False, repair_alternation=False,
+                                                       include_row_ids=True)
+                    def comparison(messages):
+                        return [(m.get("role"), _comparison_content(m), m.get("tool_calls"), m.get("tool_call_id"))
+                                for m in messages if m.get("role") in {"user", "assistant", "tool", "function"}]
+                    expected = [m for m in expected_messages if m.get("role") in {"user", "assistant", "tool", "function"}]
+                    current = [m for m in durable if m.get("role") in {"user", "assistant", "tool", "function"}]
+                    identities_match = all(
+                        all(k not in expected_row or expected_row[k] == current_row.get(k)
+                            for k in ("_row_id", "timestamp"))
+                        for expected_row, current_row in zip(expected, current)
+                    )
+                    if identities_match and comparison(current) == comparison(expected):
+                        target_id = user["id"]
+            if user["id"] != target_id:
+                return False
+            # Resolve pending and mark the owned request in the same transaction as
+            # its failure boundary. Request metadata survives summary-only compaction.
+            from hermes_state_retry import clear_owned_codex_pending
+            clear_owned_codex_pending(db, conn, session_id, user, failed=True)
+            tail = conn.execute("SELECT id, role, display_metadata FROM messages WHERE session_id=? "
+                                "AND active=1 AND compacted=0 AND role IN ('user','assistant','tool') "
+                                "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+            if tail["role"] == "assistant":
+                meta = db._decode_display_metadata(tail["display_metadata"]) or {}
+                meta["codex_auth_failure"] = True
+                conn.execute("UPDATE messages SET display_metadata=? WHERE id=?",
+                             (db._encode_display_metadata(meta), tail["id"]))
+                return True
+            msg = {"content": notice, "display_metadata": {"codex_auth_failure": True}}
+            params = db._message_row_params(session_id, "assistant", msg, None, time.time(), keep_reasoning=True)
+            conn.execute(_INSERT_MESSAGE_SQL, params)
+            db._bump_session_counters(conn, session_id, 1, 0, unit=True)
+            return True
+        with self._get_transcript_drain_lock():
+            try:
+                closed = db._execute_write(close, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+            except Exception:
+                logger.warning("Codex failed-turn boundary unavailable for session %s", session_id)
+                return False
+            if closed:
+                self._uncertain_auth_failures.discard(original_session_id)
+                self._uncertain_auth_failures.discard(session_id)
+            return closed
+
+    def complete_codex_auth_turn(self, session_id: str, input_owner: str) -> bool:
+        """Clear a pending gateway Codex input only after its completed turn is durable."""
+        if not input_owner:
+            return False
+        session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return False
+        def complete(conn):
+            db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
+            user = conn.execute("SELECT * FROM messages WHERE session_id=? AND role='user' AND active=1 "
+                                "AND compacted=0 ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+            if not user:
+                return False
+            meta = db._decode_display_metadata(user["display_metadata"]) or {}
+            if meta.get("gateway_input_owner") != input_owner or meta.get("codex_auth_pending") is not True:
+                return False
+            tail = conn.execute("SELECT role,tool_calls,display_metadata FROM messages WHERE session_id=? "
+                                "AND active=1 AND role IN ('user','assistant','tool') ORDER BY id DESC LIMIT 1",
+                                (session_id,)).fetchone()
+            if tail["role"] != "assistant" or tail["tool_calls"] not in (None, "[]") or (
+                db._decode_display_metadata(tail["display_metadata"]) or {}
+            ).get("codex_auth_failure") is True:
+                return False
+            from hermes_state_retry import clear_owned_codex_pending
+            clear_owned_codex_pending(db, conn, session_id, user)
+            return True
+        try:
+            return db._execute_write(complete, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+        except Exception:
+            logger.warning("Completed Codex turn evidence unavailable for session %s", session_id)
+            return False
+
     def transcript_tail_role(self, session_id: str) -> Optional[str]:
         """Role of the newest live conversation row on the route ``load_transcript`` reads (``None``
         when empty, no DB, or the read fails — the boundary write would fail the same way)."""
@@ -481,7 +642,8 @@ class SessionTranscriptMixin:
 
     def rewrite_transcript(
         self, session_id: str, messages: List[Dict[str, Any]], active_only: bool = False,
-        reject_active_turn_lease: bool = False) -> bool:
+        reject_active_turn_lease: bool = False,
+        retry_expected_history: Optional[List[Dict[str, Any]]] = None) -> bool:
         """Replace a session's transcript (/retry, /compress). DESTRUCTIVE by default:
         ``active_only=False`` DELETEs every row incl. soft-archived compaction history (pass
         ``active_only=True`` for sessions that may carry archived rows). True when the write lands
@@ -490,8 +652,10 @@ class SessionTranscriptMixin:
         rewrites that do not own the cross-process turn lease."""
         db = self._db_for_session_id(session_id)
         if not db:
-            return True
+            return retry_expected_history is None
         with self._get_transcript_drain_lock():
+            if retry_expected_history is not None and session_id in self._uncertain_auth_failures:
+                return False
             try:
                 # Even when the current agent doesn't "own" persistence, the session on disk may already
                 # carry compaction-archived rows — e.g. after a model switch or a /restore, both of which
@@ -506,7 +670,8 @@ class SessionTranscriptMixin:
                 # avoids.
                 db.replace_messages(
                     session_id, messages, active_only=active_only,
-                    reject_active_turn_lease=reject_active_turn_lease)
+                    reject_active_turn_lease=reject_active_turn_lease,
+                    retry_expected_history=retry_expected_history)
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
                 return False
@@ -540,6 +705,8 @@ class SessionTranscriptMixin:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the
         same routing writes use — the in-memory reroute map, then the durable compression tip —
         otherwise the transcript "vanishes" while every message sits under the child."""
+        if session_id in self._uncertain_auth_failures:
+            raise TranscriptReadError(session_id)
         if not self._db_for_session_id(session_id):
             return []
         session_id = self._follow_reroutes(session_id)
@@ -550,7 +717,7 @@ class SessionTranscriptMixin:
         try:
             # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
             return self._db_for_session_id(session_id).get_messages_as_conversation(
-                session_id, repair_alternation=True)
+                session_id, repair_alternation=True, reject_pending_codex_auth=True)
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers
             # must fail closed, not start from [].
@@ -561,6 +728,7 @@ class SessionTranscriptMixin:
 
     def rewind_session(
         self, session_id: str, n: int = 1, *, require_retryable_composite: bool = False,
+        retry_expected_history: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete (``active=0``), mirroring CLI ``/undo [N]``.
         Returns ``{"rewound_count", "turns_undone", "target_text"}`` or ``None`` (no DB / no rewindable
@@ -573,10 +741,13 @@ class SessionTranscriptMixin:
             return None
         from hermes_state_rewind import RewindTargetUnavailableError
         with self._get_transcript_drain_lock():
+            if retry_expected_history is not None and session_id in self._uncertain_auth_failures:
+                return None
             try:
                 outcome = db.rewind_user_turn(
                     session_id, -max(n, 1), require_retryable=require_retryable_composite,
-                    require_composite=require_retryable_composite)
+                    require_composite=require_retryable_composite,
+                    retry_expected_history=retry_expected_history)
             except RewindTargetUnavailableError as e:
                 logger.debug("rewind_session: %s", e)
                 return None

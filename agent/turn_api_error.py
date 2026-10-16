@@ -121,10 +121,14 @@ def handle_api_error(
         classified.retryable, classified.should_compress,
         classified.should_rotate_credential, classified.should_fallback,
     )
+    safe_error = str(api_error)
+    if getattr(agent, "provider", None) == "openai-codex" and classified.is_auth:
+        from agent.codex_auth_recovery import codex_auth_failure
+        safe_error = codex_auth_failure(api_error)["kind"]
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
-        error_type=type(api_error).__name__, error_message=str(api_error), status_code=status_code,
+        error_type=type(api_error).__name__, error_message=safe_error, status_code=status_code,
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
@@ -154,11 +158,25 @@ def handle_api_error(
         if agent.clear_interrupt(preserve_redirect=True):
             _retry.restart_with_redirected_messages = True
             return _verdict("break")
-        return _verdict("return", abort_turn_on_interrupt(
+        auth_failure = None
+        interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
+        if getattr(agent, "provider", None) == "openai-codex" and classified.is_auth:
+            from agent.codex_auth_recovery import codex_auth_failure, codex_auth_notice
+            auth_failure = codex_auth_failure(
+                api_error, _retry.codex_refresh_outcome,
+                fallback_configured=bool(agent._fallback_chain),
+                fallback_attempted=bool(_retry.auth_failover_attempted),
+            )
+            interrupt_text = "Operation interrupted. " + codex_auth_notice(auth_failure)
+        result = abort_turn_on_interrupt(
             agent, messages, conversation_history, api_call_count,
             abort_message="Interrupt detected during error handling, aborting retries.",
-            interrupt_text=f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))}).",
-        ))
+            interrupt_text=interrupt_text,
+        )
+        if auth_failure:
+            result.update(auth_failure=auth_failure, failed=True, failure_reason=classified.reason.value,
+                          failure_retryable=False)
+        return _verdict("return", result)
 
     _ce = route_classified_error(
         agent, api_error, classified, _retry, error_msg=error_msg, error_context=error_context,
@@ -336,6 +354,8 @@ def settle_unrecovered_error(
             # before a silent abort.
             if agent._has_pending_fallback():
                 _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
+                if classified.is_auth:
+                    _retry.auth_failover_attempted = True
                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
@@ -350,7 +370,7 @@ def settle_unrecovered_error(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
-            base_url=_base, model=_model, delivered=_delivered,
+            base_url=_base, model=_model, delivered=_delivered, retry_state=_retry,
         ))
 
     if retry_count >= max_retries:

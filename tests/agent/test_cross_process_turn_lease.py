@@ -39,6 +39,18 @@ class _DB:
         self.events.append(("reload", session_id, kwargs))
         return [{"role": "user", "content": "durable latest"}]
 
+    def read_turn_admission(self, session_id, holder, *, reload_history=False, allow_missing=False, reject_auth_failure=False):
+        try:
+            durable = self.get_session(session_id) is not None
+        except Exception:
+            durable = None
+        if not reload_history or durable is False:
+            return session_id, None, durable
+        target = self.resolve_resume_session_id(session_id)
+        history = self.get_messages_as_conversation(target, repair_alternation=True,
+            include_row_ids=True, reject_pending_codex_auth=True)
+        return target, history if durable or history else None, durable
+
     def refresh_session_turn_lease(self, session_id, holder, **kwargs):
         return True
 
@@ -121,6 +133,7 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch, signal):
     assert db.events[2][2] == {
         "repair_alternation": True,
         "include_row_ids": True,
+        "reject_pending_codex_auth": True,
     }
     texts = [text or "" for _kind, text in status_events]
     for notice in ("Another Hermes process", "Session is free"):

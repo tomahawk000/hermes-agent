@@ -809,6 +809,7 @@ class SessionStore(
         # One transcript drainer at a time: parent->child queue migration stays linearizable.
         self._transcript_drain_lock = threading.RLock()
         self._transcript_reroutes: Dict[str, str] = {}
+        self._uncertain_auth_failures: set[str] = set()
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
         # Monotonic timestamp of the last FTS5 rebuild attempt, or None before any attempt; see

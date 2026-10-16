@@ -241,6 +241,10 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # The merge witness rides on the survivor's row (an owned column: a row-addressed rewrite of the
     # survivor writes it too), so a restart sees which rows the composite folded.
     copy_identity_fields(msg, row)
+    if is_current_turn_user and role == "user" and getattr(agent, "provider", None) == "openai-codex":
+        meta = row.get("display_metadata") or {}
+        if meta.get("gateway_input_owner"):
+            row["display_metadata"] = {**meta, "codex_auth_pending": True}
     if isinstance(msg.get(DB_ROW_SNAPSHOT), str):
         row[DB_ROW_SNAPSHOT] = msg[DB_ROW_SNAPSHOT]
     return row
@@ -298,6 +302,9 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
+    for msg, row in zip(batch_msgs, batch_rows):
+        if (row.get("display_metadata") or {}).get("codex_auth_pending") is True:
+            msg["display_metadata"] = dict(row["display_metadata"])
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
         # The insert already rewrote the older rows (SessionDB._drop_shadowed_checkpoint_rows); mirror it on
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
