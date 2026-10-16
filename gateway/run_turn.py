@@ -165,6 +165,14 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
+def _gateway_input_owner(source, message_id):
+    """Transport-scoped redelivery identity; keyless invocations remain independent."""
+    import uuid
+    namespace = [source.platform.value, source.profile, source.scope_id,
+                 source.chat_id, source.thread_id, str(message_id)]
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace))) if message_id else str(uuid.uuid4())
+
+
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
@@ -1858,7 +1866,9 @@ class GatewayTurnMixin:
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
         codex_failure = (agent_result.get("auth_failure") or {}).get("provider") == "openai-codex"
-        if codex_failure:
+        settled = (agent_result.get("request_persistence") or {}).get("settled") is True
+        primary_attempted = (agent_result.get("request_persistence") or {}).get("settlement_attempted") is True
+        if codex_failure and not settled:
             await store.note_uncertain_auth_failure(sid)
 
         if is_context_overflow_failure:
@@ -1887,7 +1897,7 @@ class GatewayTurnMixin:
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
-                if codex_failure:
+                if codex_failure and not settled and not primary_attempted:
                     agent_result["request_persistence"] = await store.failed_request_evidence(sid, str(event.message_id or ""))
                     evidence = agent_result["request_persistence"]
                     evidence["retry_blocked"] = True
@@ -1896,8 +1906,14 @@ class GatewayTurnMixin:
                         input_owner=prepared.persistence_owner, platform_message_id=str(event.message_id or ""),
                         expected_messages=agent_messages,
                     )
-                else:
+                elif not codex_failure and not primary_attempted:
                     await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+                    if not settled:
+                        receipt = await store.settle_failed_codex_turn(
+                            sid, prepared.persistence_owner, platform_message_id=str(event.message_id or ""),
+                            interrupted=agent_result.get("interrupted") is True)
+                        if isinstance(receipt, dict):
+                            agent_result["request_persistence"] = receipt
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
@@ -1929,7 +1945,7 @@ class GatewayTurnMixin:
                             _user_msg_id_attached = True
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
-                if agent_result.get("completed") is True and not agent_result.get("interrupted"):
+                if not settled and not primary_attempted and agent_result.get("completed") is True and not agent_result.get("interrupted"):
                     await store.complete_codex_auth_turn(sid, prepared.persistence_owner)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
@@ -2159,11 +2175,7 @@ class GatewayTurnMixin:
         self._bind_adapter_run_generation(self._delivery_adapter_for(source), session_key, run_generation)
         # Delivery IDs are only unique in their transport namespace. Keyless turns
         # need their own identity, even when another process writes to this session.
-        import uuid
-        namespace = [source.platform.value, source.profile, source.scope_id,
-                     source.chat_id, source.thread_id, str(event.message_id)]
-        owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
-                 if event.message_id else str(uuid.uuid4()))
+        owner = _gateway_input_owner(source, event.message_id)
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
@@ -3946,7 +3958,8 @@ class GatewayTurnMixin:
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
-                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    "gateway_input_owner": _gateway_input_owner(next_source, next_inbound_id),
+                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)},
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4349,6 +4362,9 @@ class GatewayTurnMixin:
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)
 
+            # A refused automatic continuation did not execute an input or own a queue drain.
+            if isinstance(response, dict) and response.get("auth_resume_blocked") is True:
+                return response
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)

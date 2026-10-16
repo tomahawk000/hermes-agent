@@ -1617,6 +1617,12 @@ class SessionMessagesMixin:
             "AND compacted=0 AND display_metadata IS NOT NULL", (session_id,))
         validate_history_auth_state(rows, reject_pending=True)
 
+    def settle_gateway_input(self, session_id: str, **kwargs):
+        """Commit owned terminal evidence before releasing its turn lease."""
+        from hermes_state_retry import settle_owned_input
+        return self._execute_write(lambda conn: settle_owned_input(self, conn, session_id, **kwargs),
+                                   patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def read_turn_admission(self, session_id: str, holder: str, *, reload_history: bool = False,
                             allow_missing: bool = False, reject_auth_failure: bool = False):
         """Resolve, verify ownership and validate execution state in one writer snapshot.

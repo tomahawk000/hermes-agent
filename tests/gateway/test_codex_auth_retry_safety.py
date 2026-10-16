@@ -90,9 +90,11 @@ def test_real_agent_flush_fences_input_before_mock_api_and_gateway_resolves_boun
                                     persist_user_platform_id="offline-input")
     assert len(calls) == (2 if outcome == "fallback_success" else 1)
     assert result["completed"] is (outcome != "expired")
-    assert result["messages"][0]["display_metadata"]["codex_auth_pending"] is True
-    with pytest.raises(TranscriptReadError):
-        store.load_transcript(entry.session_id)
+    # The terminal input is settled before the facade releases its lease, not
+    # by a later gateway presentation write.
+    assert result["messages"][0]["display_metadata"]["codex_auth_pending"] is False
+    assert result["request_persistence"]["settled"] is True
+    assert store.load_transcript(entry.session_id)
     messages = result["messages"]
     asyncio.run(runner._hmwa_persist_turn_transcript(
         event=MessageEvent(text="offline action", source=source, message_id="offline-input"),
@@ -303,7 +305,8 @@ def test_pending_input_requires_durable_matching_completion(setup, monkeypatch, 
     if outcome == "success":
         assert reply == "mock retry result"
         runner._handle_message.assert_awaited_once()
-        assert before[0]["display_metadata"] == {"gateway_input_owner": "owner", "other": True, "codex_auth_pending": False}
+        assert before[0]["display_metadata"] == {"gateway_input_owner": "owner", "other": True, "codex_auth_pending": False,
+                                                   "gateway_input_outcome": "completed"}
     else:
         runner._handle_message.assert_not_awaited()
         assert db.get_messages(sid, include_inactive=True) == before

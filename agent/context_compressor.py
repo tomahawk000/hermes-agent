@@ -5594,7 +5594,7 @@ def is_compaction_summary_message(message: Any) -> bool:
 
 # Display metadata that survives projection; other metadata may describe synthetic events and must
 # not look human.
-SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions", "gateway_input_owner", "codex_auth_pending", "codex_auth_failure")
+SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions", "gateway_input_owner", "codex_auth_pending", "codex_auth_failure", "gateway_input_outcome")
 
 
 def _handoff_only_content(content: Any) -> Any:

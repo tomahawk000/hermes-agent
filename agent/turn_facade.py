@@ -142,6 +142,8 @@ class TurnFacadeMixin:
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
             with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
+                previous_input_owner = getattr(self, "_gateway_input_owner", None)
+                self._gateway_input_owner = (persist_user_display_metadata or {}).get("gateway_input_owner")
                 try:
                     if lease is not None:
                         lease.start()
@@ -155,7 +157,10 @@ class TurnFacadeMixin:
                         turn_author=turn_author,
                         title_user_message=title_user_message,
                     )
+                    from agent.session_persistence import settle_gateway_turn_before_release
+                    settle_gateway_turn_before_release(self, result, persist_user_display_metadata)
                 finally:
+                    self._gateway_input_owner = previous_input_owner
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.
                     if lease is not None:

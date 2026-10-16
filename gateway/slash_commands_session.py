@@ -401,6 +401,10 @@ class GatewaySessionCommandsMixin:
             # Plain /retry selects the latest turn and has no pinned-input CAS. Keep this
             # failed request intact until an operator reviews effects and authorizes replay.
             return "Cannot retry this Codex authentication failure safely. Review the saved request and any tool effects after restoring access before authorizing another attempt."
+        from hermes_state_retry import REPLAY_BLOCKED_OUTCOMES
+        if any((m.get("display_metadata") or {}).get("gateway_input_outcome") in REPLAY_BLOCKED_OUTCOMES
+               for m in history[last_user_idx:]):
+            return "Cannot retry this turn safely. Review the saved request and any tool effects before authorizing another attempt."
         # Resolve text + scaffold-preserving prefix BEFORE any write; messaging retries cannot
         # reconstruct attachments, so media/unknown content is rejected with the session untouched.
         try:

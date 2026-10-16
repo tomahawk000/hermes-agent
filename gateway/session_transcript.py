@@ -487,6 +487,11 @@ class SessionTranscriptMixin:
                 ), next_user AS (
                     SELECT MIN(id) AS id FROM messages WHERE session_id=? AND role='user'
                     AND active=1 AND compacted=0 AND id > (SELECT id FROM target)
+                    AND NOT (COALESCE(display_kind,'')='steer' AND
+                        ((platform_message_id IS NULL AND json_extract(display_metadata,'$.gateway_input_owner') IS NULL) OR
+                         COALESCE(json_extract(display_metadata,'$.gateway_input_owner') =
+                         (SELECT json_extract(display_metadata,'$.gateway_input_owner') FROM messages
+                          WHERE id=(SELECT id FROM target)), 0)))
                 )
                 SELECT target.id, (SELECT id FROM next_user) IS NULL AS current,
                     EXISTS(SELECT 1 FROM messages WHERE session_id=? AND active=1 AND compacted=0
@@ -516,9 +521,6 @@ class SessionTranscriptMixin:
         Do not queue a refused/failed write for later: a delayed boundary could close an
         unrelated turn. This method never rewrites input or authorizes execution.
         """
-        from hermes_state_messages import _INSERT_MESSAGE_SQL
-        import time
-
         original_session_id = session_id
         session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
         db = self._db_for_session_id(session_id)
@@ -527,7 +529,7 @@ class SessionTranscriptMixin:
         def close(conn):
             db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
             user = conn.execute("SELECT * FROM messages WHERE session_id=? AND role='user' "
-                                "AND active=1 AND compacted=0 ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+                                "AND active=1 AND compacted=0 AND COALESCE(display_kind,'')!='steer' ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
             if not user:
                 return False
             meta = db._decode_display_metadata(user["display_metadata"]) or {}
@@ -565,24 +567,11 @@ class SessionTranscriptMixin:
                         target_id = user["id"]
             if user["id"] != target_id:
                 return False
-            # Resolve pending and mark the owned request in the same transaction as
-            # its failure boundary. Request metadata survives summary-only compaction.
-            from hermes_state_retry import clear_owned_codex_pending
-            clear_owned_codex_pending(db, conn, session_id, user, failed=True)
-            tail = conn.execute("SELECT id, role, display_metadata FROM messages WHERE session_id=? "
-                                "AND active=1 AND compacted=0 AND role IN ('user','assistant','tool') "
-                                "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
-            if tail["role"] == "assistant":
-                meta = db._decode_display_metadata(tail["display_metadata"]) or {}
-                meta["codex_auth_failure"] = True
-                conn.execute("UPDATE messages SET display_metadata=? WHERE id=?",
-                             (db._encode_display_metadata(meta), tail["id"]))
-                return True
-            msg = {"content": notice, "display_metadata": {"codex_auth_failure": True}}
-            params = db._message_row_params(session_id, "assistant", msg, None, time.time(), keep_reasoning=True)
-            conn.execute(_INSERT_MESSAGE_SQL, params)
-            db._bump_session_counters(conn, session_id, 1, 0, unit=True)
-            return True
+            from hermes_state_retry import settle_owned_input
+            result = settle_owned_input(db, conn, session_id, input_owner=input_owner,
+                user_row_id=target_id, platform_message_id=platform_message_id,
+                auth_failure=True, failed=True, notice=notice)
+            return result.get("settled") is True
         with self._get_transcript_drain_lock():
             try:
                 closed = db._execute_write(close, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
@@ -603,29 +592,29 @@ class SessionTranscriptMixin:
         if db is None:
             return False
         def complete(conn):
-            db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
-            user = conn.execute("SELECT * FROM messages WHERE session_id=? AND role='user' AND active=1 "
-                                "AND compacted=0 ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
-            if not user:
-                return False
-            meta = db._decode_display_metadata(user["display_metadata"]) or {}
-            if meta.get("gateway_input_owner") != input_owner or meta.get("codex_auth_pending") is not True:
-                return False
-            tail = conn.execute("SELECT role,tool_calls,display_metadata FROM messages WHERE session_id=? "
-                                "AND active=1 AND role IN ('user','assistant','tool') ORDER BY id DESC LIMIT 1",
-                                (session_id,)).fetchone()
-            if tail["role"] != "assistant" or tail["tool_calls"] not in (None, "[]") or (
-                db._decode_display_metadata(tail["display_metadata"]) or {}
-            ).get("codex_auth_failure") is True:
-                return False
-            from hermes_state_retry import clear_owned_codex_pending
-            clear_owned_codex_pending(db, conn, session_id, user)
-            return True
+            from hermes_state_retry import settle_owned_input
+            result = settle_owned_input(db, conn, session_id, input_owner=input_owner, completed=True)
+            return result.get("settled") is True
         try:
             return db._execute_write(complete, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
         except Exception:
             logger.warning("Completed Codex turn evidence unavailable for session %s", session_id)
             return False
+
+    def settle_failed_codex_turn(self, session_id: str, input_owner: str, *, platform_message_id="",
+                                 interrupted=False):
+        """Gateway-persisted runtime fallback; active agent holders are never bypassed."""
+        db = self._db_for_session_id(session_id)
+        if db is None or not input_owner:
+            return None
+        try:
+            result = db.settle_gateway_input(session_id, input_owner=input_owner,
+                platform_message_id=platform_message_id, failed=True, interrupted=interrupted)
+            result.pop("_row_updates", None)
+            return result
+        except Exception:
+            logger.warning("Closed gateway input settlement unavailable for session %s", session_id)
+            return None
 
     def transcript_tail_role(self, session_id: str) -> Optional[str]:
         """Role of the newest live conversation row on the route ``load_transcript`` reads (``None``
