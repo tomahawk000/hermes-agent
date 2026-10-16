@@ -568,8 +568,19 @@ class ClientLifecycleMixin:
         return self._replace_primary_openai_client(reason=reason)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+        from agent.codex_auth_recovery import refresh_outcome
+
+        def record(reason, *, resolver_invoked=False, exc=None):
+            self._codex_refresh_outcome = refresh_outcome(
+                reason, resolver_invoked=resolver_invoked,
+                force_requested=resolver_invoked and force is True, exc=exc,
+            )
+            label = self.provider if self.provider in {"openai-codex", "xai-oauth"} else "ineligible"
+            logger.info("OAuth credential recovery (%s): %s", label, self._codex_refresh_outcome)
             return False
+
+        if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+            return record("route_ineligible")
         # No silent account swap: a non-singleton credential (manual pool entry, explicit api_key=) must not be
         # replaced by the device_code singleton's tokens — the pool's reactive recovery owns that case.
         try:
@@ -580,29 +591,28 @@ class ClientLifecycleMixin:
             )
             singleton_now = resolve(refresh_if_expiring=False)
         except Exception as exc:
-            logger.debug("%s singleton read failed: %s", self.provider, exc)
-            return False
+            return record("credential_read_failed", exc=exc)
         singleton_key = str(singleton_now.get("api_key") or "").strip()
         old_key = str(self.api_key or "").strip()
         if singleton_key and old_key and singleton_key != old_key:
-            logger.debug(
-                "%s singleton tokens differ from the active api_key; skipping singleton force-refresh to avoid "
-                "silent account swap. Reactive credential rotation should go through the pool.", self.provider,
-            )
-            return False
+            return record("identity_guard")
         try:
             creds = resolve(force_refresh=force)
         except Exception as exc:
-            logger.debug("%s credential refresh failed: %s", self.provider, exc)
-            return False
+            return record("refresh_failed", resolver_invoked=True, exc=exc)
         api_key, base_url = creds.get("api_key"), creds.get("base_url")
         if not _valid_credential_pair(api_key, base_url):
-            return False
+            return record("invalid_credentials", resolver_invoked=True)
         # No NEW token minted (the resolver returns the same stale token when refresh fails) → False.
         if old_key and api_key.strip() == old_key:
-            logger.debug("%s credential refresh returned the same token; refresh likely failed silently", self.provider)
-            return False
-        return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
+            return record("unchanged_credentials", resolver_invoked=True)
+        try:
+            adopted = self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
+        except Exception:
+            record("client_rebuild_failed", resolver_invoked=True)
+            raise
+        record("refreshed" if adopted else "client_rebuild_failed", resolver_invoked=True)
+        return adopted
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:
         # Portal serves anthropic/* on the native Messages route, so either client kind may hold the expiring JWT.
