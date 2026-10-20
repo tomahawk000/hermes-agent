@@ -25,11 +25,14 @@ concurrency:
   group: tests-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
+# Upstream's named larger runners belong to its organization. Forks retain every
+# job and native OS/architecture lane on standard hosted runners; lower worker
+# counts and longer job budgets accommodate their CPU/memory without changing tests.
 jobs:
   test:
     name: Run tests
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 240 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -91,7 +94,7 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '32' || '4' }}
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -111,8 +114,8 @@ jobs:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 240 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -176,7 +179,7 @@ jobs:
           # across unrelated SQLite, tenancy, provider and terminal suites.
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
           # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '3' || '2' }}
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
@@ -231,8 +234,8 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 60 || 240 }}
     strategy:
       fail-fast: false
       matrix:
@@ -341,7 +344,7 @@ jobs:
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
           # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '6' || '2' }}
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

@@ -63,11 +63,14 @@ concurrency:
   group: tests-os-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
+# Upstream's named larger runners belong to its organization. Forks retain every
+# job and native OS/architecture lane on standard hosted runners; lower worker
+# counts and longer job budgets accommodate their CPU/memory without changing tests.
 jobs:
   os-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 30 }}
+    timeout-minutes: ${{ github.repository != 'NousResearch/hermes-agent' && matrix.marker == 'windows' && 120 || matrix.timeout || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -76,10 +79,10 @@ jobs:
             runner: macos-latest
             marker: macos
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
             marker: windows
             timeout: 60
     steps:
@@ -174,7 +177,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository == 'NousResearch/hermes-agent' && '16' || '2') || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
@@ -208,8 +211,8 @@ jobs:
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: windows-latest-32-core
-    timeout-minutes: 25
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 25 || 120 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -228,7 +231,7 @@ jobs:
           scripts/run_tests.sh tests/e2e/core/windows/ -- \
             -m "platforms and integration" -v --tb=short -rA
         env:
-          HERMES_TEST_WORKERS: '6'
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '6' || '2' }}
           HERMES_TEST_FILE_TIMEOUT: '900'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
