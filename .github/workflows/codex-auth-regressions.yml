@@ -49,7 +49,9 @@ jobs:
             tests/gateway/test_codex_auth_terminal_integration.py \
             tests/gateway/test_current_auth_notice_probe.py \
             tests/gateway/test_duplicate_user_message.py \
-            tests/gateway/test_queued_final_ledger.py
+            tests/gateway/test_queued_final_ledger.py \
+            tests/hermes_cli/test_update_git_locator.py \
+            tests/hermes_cli/test_cmd_update.py
         env:
           HERMES_TEST_FILE_RETRIES: '0'
           HERMES_TEST_FILE_TIMEOUT: '180'
