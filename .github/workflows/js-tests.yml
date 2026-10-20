@@ -90,4 +90,6 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Every workspace check still runs; serialize on smaller fork runners
+        # so nested test/build workers cannot starve unchanged per-test deadlines.
+        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository != 'NousResearch/hermes-agent' && '--concurrency 1' || '' }}
