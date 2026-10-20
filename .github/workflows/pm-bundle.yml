@@ -53,6 +53,8 @@ concurrency:
   group: pm-bundle-${{ inputs.release == true && github.run_id || github.ref }}
   cancel-in-progress: ${{ inputs.release != true }}
 
+# Organization-specific larger runner labels are available upstream only.
+# Forks retain every native platform/architecture check on standard runners.
 jobs:
   bundle:
     name: bundle ${{ matrix.target.label }}
@@ -76,9 +78,9 @@ jobs:
           - label: darwin-x64
             runner: macos-15-intel
           - label: win32-x64
-            runner: windows-latest-32-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
