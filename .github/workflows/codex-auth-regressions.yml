@@ -1,0 +1,55 @@
+name: Codex auth regression verification
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - 'gateway/**'
+      - 'hermes_state*.py'
+      - 'tests/agent/**'
+      - 'tests/gateway/**'
+      - '.github/workflows/codex-auth-regressions.yml'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: codex-auth-regressions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up locked Python and isolated test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+      - name: Real imports, durable input ownership and gateway result regressions
+        run: |
+          scripts/run_tests.sh -j 4 \
+            tests/agent/test_codex_auth_failure.py \
+            tests/agent/test_codex_auth_lease_admission.py \
+            tests/agent/test_codex_auth_restart_admission.py \
+            tests/agent/test_codex_auth_tip_admission.py \
+            tests/agent/test_codex_refresh_diagnostics.py \
+            tests/agent/test_cross_process_turn_lease.py \
+            tests/agent/test_failed_turn_chat_copy.py \
+            tests/agent/test_run_agent_codex_responses.py \
+            tests/agent/test_turn_facade_lease.py \
+            tests/agent/test_turn_liveness_watchdog.py \
+            tests/gateway/test_codex_auth_failure.py \
+            tests/gateway/test_codex_auth_input_ownership.py \
+            tests/gateway/test_codex_auth_retry_safety.py \
+            tests/gateway/test_codex_auth_settlement_failure.py \
+            tests/gateway/test_codex_auth_settlement_guards.py \
+            tests/gateway/test_codex_auth_terminal_integration.py \
+            tests/gateway/test_current_auth_notice_probe.py \
+            tests/gateway/test_duplicate_user_message.py \
+            tests/gateway/test_queued_final_ledger.py
+        env:
+          HERMES_TEST_FILE_RETRIES: '0'
+          HERMES_TEST_FILE_TIMEOUT: '180'
