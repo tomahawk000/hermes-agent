@@ -212,8 +212,9 @@ class TestLoadTranscriptReroutes:
         assert db is not None
         monkeypatch.setattr(db, "get_compression_tip", lambda _session_id: None)
 
-        def _malformed(_session_id, *, repair_alternation):
+        def _malformed(_session_id, *, repair_alternation, reject_pending_codex_auth):
             assert repair_alternation is True
+            assert reject_pending_codex_auth is True
             raise RuntimeError("database disk image is malformed")
 
         monkeypatch.setattr(db, "get_messages_as_conversation", _malformed)
