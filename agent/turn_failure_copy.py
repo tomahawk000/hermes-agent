@@ -421,8 +421,12 @@ def relogin_command_hint(provider: Any) -> str:
 
 def nonretryable_copy(
     classified: Any, *, provider: Any, model: Any, summary: str, prefix_suggestion: Optional[str] = None,
+    auth_failure: Optional[dict] = None,
 ) -> str:
     """Chat copy for a terminal non-retryable rejection (auth, model missing, TLS, generic 4xx)."""
+    if provider == "openai-codex" and getattr(classified, "is_auth", False):
+        from agent.codex_auth_recovery import codex_auth_failure, codex_auth_notice
+        return codex_auth_notice(auth_failure or codex_auth_failure(RuntimeError(summary)))
     label = provider_label_for(provider)
     if getattr(classified, "is_auth", False):
         from agent.error_surface import auth_kind

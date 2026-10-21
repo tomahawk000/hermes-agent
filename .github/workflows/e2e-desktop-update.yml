@@ -23,11 +23,14 @@ concurrency:
   group: e2e-desktop-update-${{ github.ref }}
   cancel-in-progress: true
 
+# Upstream's named larger runners belong to its organization. Forks retain every
+# job and native OS/architecture lane on standard hosted runners; lower worker
+# counts and longer job budgets accommodate their CPU/memory without changing tests.
 jobs:
   update:
     name: Desktop install/update E2E (Linux, ${{ matrix.cell }})
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 120 }}
     # Advisory until stable on CI (see ci.yaml): a red shard does not fail the caller.
     continue-on-error: true
     strategy:

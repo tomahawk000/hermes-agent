@@ -2612,3 +2612,147 @@ def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypa
     assert result["completed"] is True
     assert not any(m.get("_length_continuation_nudge") for m in result["messages"])
     assert any(m.get("finish_reason") == "incomplete" for m in result["messages"] if m["role"] == "assistant")
+
+
+@pytest.mark.parametrize("effects", [False, True])
+def test_interrupt_during_failed_codex_refresh_keeps_sanitized_failure(monkeypatch, effects):
+    import httpx
+    import openai
+    from unittest.mock import Mock
+    from gateway.config import Platform
+    from gateway.run import _sanitize_gateway_final_response
+
+    agent = _build_agent(monkeypatch)
+    agent.provider = agent.requested_provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    calls = []
+    sentinel = "RAW-AUTH-DETAIL-SENTINEL"
+    def request(_kwargs):
+        calls.append(True)
+        if effects and len(calls) == 1:
+            return _codex_tool_call_response()
+        response = httpx.Response(401, request=httpx.Request("POST", "https://example.invalid"))
+        raise openai.AuthenticationError("Provided authentication token is expired " + sentinel,
+                                         response=response, body={"error": {"code": "access_token_expired"}})
+    monkeypatch.setattr(agent, "_interruptible_api_call", request)
+    def execute(assistant, messages, *_args):
+        messages.append({"role": "tool", "tool_call_id": assistant.tool_calls[0].id,
+                         "content": "mock effect already completed"})
+    monkeypatch.setattr(agent, "_execute_tool_calls", execute)
+    def refresh(**_kwargs):
+        agent._codex_refresh_outcome = {"resolver_invoked": True, "force_requested": True, "outcome": "refresh_failed", "code": None, "relogin_required": None}
+        agent.interrupt(hard_cancel=True)
+        return False
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", refresh)
+    monkeypatch.setattr(agent, "_invoke_api_request_error_hook", Mock())
+    result = agent.run_conversation("offline action")
+    chat = _sanitize_gateway_final_response(Platform.TELEGRAM, result.get("final_response"))
+    assert result["interrupted"] and result["failed"] and not result["completed"]
+    assert result["auth_failure"]["provider"] == "openai-codex"
+    assert result["auth_failure"]["refresh"]["resolver_invoked"] is True
+    assert result["failure_retryable"] is False
+    assert sentinel not in str(result) and sentinel not in chat
+    assert len(calls) == 1 + int(effects)
+
+
+
+@pytest.mark.parametrize("case", ["refresh_success", "refresh_success_rejected", "refresh_failure", "refresh_unknown", "account", "configured_fallback", "fallback_exhausted"])
+def test_codex_auth_turn_recovers_once_or_returns_one_typed_failure(monkeypatch, case):
+    """The real loop keeps successful recovery/fallback and never selects an implicit fallback."""
+    import httpx
+    import openai
+    from unittest.mock import MagicMock
+    from gateway.config import Platform
+    from gateway.run import _prepare_gateway_status_message, _sanitize_gateway_final_response
+    from hermes_cli.auth_constants import AuthError
+
+    def no_network(*a, **kw):
+        raise AssertionError("offline test attempted a network call")
+    monkeypatch.setattr(httpx.Client, "send", no_network)
+    monkeypatch.setattr(httpx.AsyncClient, "send", no_network)
+    agent = _build_agent(monkeypatch)
+    agent.provider = agent.requested_provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    model_calls, refresh_calls, deliveries = [], [], []
+    agent.status_callback = lambda event, text: deliveries.extend(
+        [prepared] if (prepared := _prepare_gateway_status_message(Platform.TELEGRAM, event, text)) else [])
+    def resolve(**kw):
+        if not kw.get("force_refresh"):
+            return {"api_key": agent.api_key, "base_url": agent.base_url}
+        refresh_calls.append(True)
+        if case in {"refresh_success", "refresh_success_rejected"}:
+            return {"api_key": "synthetic-fresh", "base_url": agent.base_url}
+        if case == "refresh_unknown":
+            raise RuntimeError("PRIVATE-REFRESH-DETAIL")
+        raise AuthError("PRIVATE-REFRESH-DETAIL", provider="openai-codex", code="invalid_grant", relogin_required=True)
+    monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials", resolve)
+    fallback = MagicMock()
+    fallback.base_url, fallback.api_key = "https://openrouter.ai/api/v1", "synthetic-fallback"
+    fallback_resolver = MagicMock(return_value=(fallback, "synthetic-model"))
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fallback_resolver)
+    if case == "fallback_exhausted":
+        fallback_resolver.return_value = (None, "synthetic-model")
+    if case in {"configured_fallback", "fallback_exhausted"}:
+        agent._fallback_chain = [{"provider": "openrouter", "model": "synthetic-model"}]
+    def request(kw):
+        model_calls.append(agent.provider)
+        if agent.provider == "openrouter":
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="OK", tool_calls=None, reasoning_content=None), finish_reason="stop")],
+                                   usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8), model="synthetic-model")
+        if case == "refresh_success" and len(model_calls) > 1:
+            return _codex_message_response("OK")
+        status = 403 if case == "account" else 401
+        response = httpx.Response(status, request=httpx.Request("POST", "https://example.invalid"))
+        body = {"error": {"code": "account_suspended" if case == "account" else "access_token_expired"}}
+        raise openai.AuthenticationError("account access rejected" if case == "account" else "Provided authentication token is expired", response=response, body=body)
+    monkeypatch.setattr(agent, "_interruptible_api_call", request)
+    result = agent.run_conversation("offline request")
+    successful = case in {"refresh_success", "configured_fallback"}
+    assert result["completed"] is successful
+    assert len(refresh_calls) == int(case != "account")
+    assert len(model_calls) == (2 if successful or case == "refresh_success_rejected" else 1)
+    if case not in {"configured_fallback", "fallback_exhausted"}:
+        fallback_resolver.assert_not_called()
+        assert agent.provider == "openai-codex"
+    else:
+        fallback_resolver.assert_called_once()
+        assert model_calls == (["openai-codex", "openrouter"] if case == "configured_fallback" else ["openai-codex"])
+    if successful:
+        assert result["final_response"] == "OK" and "auth_failure" not in result
+        assert not any("turn stopped" in d for d in deliveries)
+    else:
+        final = _sanitize_gateway_final_response(Platform.TELEGRAM, result["final_response"])
+        deliveries.append(final)
+        assert sum("turn stopped" in d for d in deliveries) == 1
+        if case != "fallback_exhausted":
+            assert deliveries == [final]
+        else:
+            assert result["auth_failure"]["fallback_configured"]
+            assert result["auth_failure"]["fallback_attempted"]
+            assert result["auth_failure"]["fallback_exhausted"]
+        assert result["auth_failure"]["kind"] == ("account_rejected" if case == "account" else "access_token_expired")
+        assert "PRIVATE-REFRESH-DETAIL" not in str(result)
+        assert not any("Nous" in d or "send it again" in d or "/login" in d for d in deliveries)
+        assert result["current_turn_user_idx"] == 0
+
+
+
+def test_codex_interruption_after_tools_keeps_effect_evidence_without_replay(monkeypatch):
+    from unittest.mock import Mock
+    from gateway.run import GatewayRunner
+    agent = _build_agent(monkeypatch)
+    request = Mock(return_value=_codex_tool_call_response())
+    monkeypatch.setattr(agent, "_interruptible_api_call", request)
+    def execute(assistant_message, messages, task_id, *_args):
+        messages.append({"role": "tool", "tool_call_id": assistant_message.tool_calls[0].id, "content": "synthetic effect"})
+        assert agent.interrupt(hard_cancel=True)
+    tools = Mock(side_effect=execute)
+    monkeypatch.setattr(agent, "_execute_tool_calls", tools)
+    result = agent.run_conversation("offline action")
+    assert result["interrupted"] and not result["completed"]
+    request.assert_called_once()
+    tools.assert_called_once()
+    assert any(m.get("role") == "tool" for m in result["messages"])
+    runner = object.__new__(GatewayRunner)
+    assert "Some actions may already have run" in runner._hmwa_failed_turn_notice(result)
+    assert "Send it again" not in runner._hmwa_failed_turn_notice(result)

@@ -87,6 +87,9 @@ def test_oauth_rejection_chat_text_names_the_provider_slug_and_the_failing_profi
         def _vprint(self, msg, **_kw):
             hints.append(msg)
 
+        def _emit_status_kind(self, kind, message, *, origin):
+            hints.append(message)
+
     result = _nonretryable(
         401, "HTTP 401: Encountered invalidated oauth token for user, failing request (code: token_revoked)",
         provider="openai-codex", model="gpt-5.6-sol", agent=_Recorder(),
@@ -94,7 +97,8 @@ def test_oauth_rejection_chat_text_names_the_provider_slug_and_the_failing_profi
     text = result["final_response"]
     assert "`hermes -p codex auth add openai-codex --type oauth`" in text
     assert "<provider>" not in text
-    assert "token_revoked" in text  # the raw error survives for the judge to quote
+    assert "token_revoked" not in text  # typed metadata replaces raw provider bodies
+    assert result["auth_failure"]["kind"] == "credential_rejected"
     # The CLI 💡 hint names the same command; it no longer sends the user to a bare `hermes auth`.
     cli_hint = "\n".join(hints)
     assert "`hermes -p codex auth add openai-codex --type oauth`" in cli_hint, cli_hint

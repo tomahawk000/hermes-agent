@@ -21,11 +21,14 @@ concurrency:
   group: e2e-desktop-core-${{ github.ref }}
   cancel-in-progress: true
 
+# Upstream's named larger runners belong to its organization. Forks retain every
+# job and native OS/architecture lane on standard hosted runners; lower worker
+# counts and longer job budgets accommodate their CPU/memory without changing tests.
 jobs:
   core:
     name: Desktop core E2E (Linux)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 120 }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
 

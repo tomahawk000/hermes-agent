@@ -3,6 +3,7 @@ Dependency-free so it imports without a cycle."""
 
 from __future__ import annotations
 
+from typing import Optional
 from dataclasses import dataclass
 
 
@@ -16,6 +17,7 @@ class TurnRetryState:
 
     # Per-provider OAuth / credential refresh guards
     codex_auth_retry_attempted: bool = False
+    codex_refresh_outcome: Optional[dict] = None
     anthropic_auth_retry_attempted: bool = False
     nous_auth_retry_attempted: bool = False
     nous_paid_entitlement_refresh_attempted: bool = False

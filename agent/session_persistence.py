@@ -241,6 +241,10 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # The merge witness rides on the survivor's row (an owned column: a row-addressed rewrite of the
     # survivor writes it too), so a restart sees which rows the composite folded.
     copy_identity_fields(msg, row)
+    if is_current_turn_user and role == "user" and getattr(agent, "provider", None) == "openai-codex":
+        meta = row.get("display_metadata") or {}
+        if meta.get("gateway_input_owner"):
+            row["display_metadata"] = {**meta, "codex_auth_pending": True}
     if isinstance(msg.get(DB_ROW_SNAPSHOT), str):
         row[DB_ROW_SNAPSHOT] = msg[DB_ROW_SNAPSHOT]
     return row
@@ -298,11 +302,86 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
+    for msg, row in zip(batch_msgs, batch_rows):
+        if (row.get("display_metadata") or {}).get("codex_auth_pending") is True:
+            msg["display_metadata"] = dict(row["display_metadata"])
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
         # The insert already rewrote the older rows (SessionDB._drop_shadowed_checkpoint_rows); mirror it on
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
+
+
+def settle_gateway_turn_before_release(agent, result, display_metadata=None):
+    """Resolve the accepted input while the facade still owns its original lease."""
+    db = getattr(agent, "_session_db", None)
+    holder = getattr(agent, "_active_session_turn_lease_holder", None)
+    if (not isinstance(result, dict) or getattr(agent, "_persist_disabled", False) or not holder
+            or not callable(getattr(type(db), "settle_gateway_input", None))):
+        return
+    owner = (display_metadata or {}).get("gateway_input_owner")
+    messages = result.get("messages") or []
+    if not owner:
+        index = result.get("current_turn_user_idx")
+        if isinstance(index, int) and 0 <= index < len(messages):
+            owner = (messages[index].get("display_metadata") or {}).get("gateway_input_owner")
+            if not owner:
+                return  # a new unowned turn must not adopt an owned historical request
+    if not owner:
+        owners = {(m.get("display_metadata") or {}).get("gateway_input_owner") for m in messages
+                  if isinstance(m, dict) and m.get("role") == "user"
+                  and (m.get("display_metadata") or {}).get("codex_auth_pending") is not False}
+        owners.discard(None)
+        if len(owners) != 1:
+            return
+        owner = owners.pop()
+    auth = (result.get("auth_failure") or {}).get("provider") == "openai-codex"
+    provider = getattr(agent, "provider", None)
+    if provider not in {None, "openai-codex"} and not auth and not any(
+        (m.get("display_metadata") or {}).get("codex_auth_pending") is True
+        for m in messages if isinstance(m, dict) and m.get("role") == "user"
+    ):
+        return  # ordinary non-Codex turns do not acquire a new settlement obligation
+    notice = ""
+    if auth:
+        from agent.codex_auth_recovery import codex_auth_notice
+        notice = codex_auth_notice(result["auth_failure"])
+    if result.get("compression_exhausted") or result.get("compression_deferred") or result.get("failure_reason") == "context_overflow":
+        return  # retain the existing oversized-session persistence exclusion
+    try:
+        receipt = db.settle_gateway_input(agent.session_id, input_owner=owner,
+            completed=result.get("completed") is True, failed=result.get("failed") is True,
+            interrupted=result.get("interrupted") is True, auth_failure=auth, notice=notice,
+            turn_lease_holder=holder)
+    except Exception:
+        logger.warning("Owned terminal input could not be settled before lease release")
+        result.update(failed=True, completed=False, error="owned_input_settlement_failed",
+            request_persistence={"saved":False,"current":False,"settled":False,
+                                 "tools_recorded":None,"settlement_attempted":True})
+        return
+    receipt["settlement_attempted"] = True
+    updates = receipt.pop("_row_updates", [])
+    by_id = {u["id"]: u for u in updates}
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        update = by_id.get(msg.get("_row_id"))
+        if update is None and msg.get("role") == "user" and (msg.get("display_metadata") or {}).get("gateway_input_owner") == owner:
+            update = next((u for u in updates if (u.get("display_metadata") or {}).get("gateway_input_owner") == owner), None)
+        if update:
+            msg["display_metadata"] = dict(update["display_metadata"])
+            if "content" in update:
+                msg["content"] = update["content"]
+                # Content ownership changed only on this turn's generated boundary.
+                msg[DB_ROW_SNAPSHOT] = update[DB_ROW_SNAPSHOT]
+    for update in updates:
+        if "_new_message" in update:
+            new = dict(update["_new_message"])
+            new[_DB_PERSISTED_MARKER] = True
+            messages.append(new)
+    result["request_persistence"] = receipt
+    if receipt.get("saved") and not receipt.get("settled") and result.get("completed") is True:
+        result.update(failed=True, completed=False, error="owned_input_completion_unproven")
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:

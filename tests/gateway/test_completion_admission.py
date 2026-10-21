@@ -25,6 +25,8 @@ def pending(key, name):
 async def drain(adapter):
     while adapter._background_tasks:
         await asyncio.gather(*list(adapter._background_tasks))
+        # An all-done gather need not yield; let task-discard callbacks run.
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

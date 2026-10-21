@@ -312,3 +312,65 @@ async def test_transcript_read_failure_stops_turn_before_agent_or_append(
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved,current", [(True, True), (False, False), (True, False)])
+async def test_codex_auth_final_receipt_uses_persistence_and_suppresses_terminal_status(monkeypatch, tmp_path, saved, current):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent.codex_auth_recovery import codex_auth_notice
+    from gateway.run_turn_runner import TurnRunner
+    runner = _bootstrap(monkeypatch, tmp_path)
+    failure = {"provider": "openai-codex", "kind": "access_token_expired", "refresh": {"relogin_required": None}}
+    runner.session_store.failed_request_evidence.return_value = {"saved": saved, "current": current, "tools_recorded": False, "row_id": 1 if saved else None}
+    runner.session_store.close_failed_auth_turn.return_value = saved and current
+    runner._run_agent = AsyncMock(return_value={
+        "failed": True, "completed": False, "final_response": codex_auth_notice(failure), "auth_failure": failure,
+        "error": "access_token_expired", "failure_reason": "auth", "failure_retryable": False,
+        "messages": [{"role": "user", "content": "hello world"}], "current_turn_user_idx": 0, "last_prompt_tokens": 0,
+    })
+    fake_adapter = SimpleNamespace(send=AsyncMock())
+    turn = object.__new__(TurnRunner)
+    turn._ctx = SimpleNamespace(_status_adapter=fake_adapter, _run_still_current=lambda: True, source=_source(),
+                               mute_notification_reply=False)
+    turn._schedule = Mock(side_effect=AssertionError("terminal status must not be scheduled"))
+    turn._status_callback_sync("terminal_auth", codex_auth_notice(failure))
+    response = await runner._handle_message_with_agent(_event(), _source(), "agent:main:telegram:group:-1001:12345", 1)
+    await fake_adapter.send(_source().chat_id, response)
+    fake_adapter.send.assert_awaited_once()
+    assert response.count("Codex's access token expired") == 1
+    assert ("Your request is saved." in response) is saved
+    assert ("No tools are recorded" in response) is (saved and current)
+    assert "Send it again" not in response and "Nous" not in response and "/login" not in response
+    turn._ctx._run_still_current = lambda: False
+    turn._status_callback_sync("terminal_auth", codex_auth_notice(failure))
+    fake_adapter.send.assert_awaited_once()
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("automatic", [True, False])
+async def test_auth_resume_refusal_is_not_persisted_as_a_new_request(monkeypatch, tmp_path, automatic):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    entry = runner.session_store.get_or_create_session.return_value
+    entry.resume_pending = True
+    event = _event()
+    event.internal = automatic
+    if automatic:
+        event.text = ""
+    runner._run_agent = AsyncMock(return_value={
+        "failed": automatic, "completed": not automatic, "auth_resume_blocked": automatic,
+        "final_response": "" if automatic else "mock completed answer", "messages": [],
+        "history_offset": 0, "last_prompt_tokens": 0,
+    })
+    response = await runner._handle_message_with_agent(event, _source(), entry.session_key, 1)
+    runner._run_agent.assert_awaited_once()
+    metadata = runner._run_agent.await_args.kwargs["persist_user_display_metadata"]
+    assert metadata.get("restart_resume", False) is automatic
+    if automatic:
+        assert response is None
+        runner.session_store.append_to_transcript.assert_not_called()
+        runner.session_store.clear_resume_pending.assert_not_called()
+    else:
+        assert response == "mock completed answer"

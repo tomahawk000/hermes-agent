@@ -63,7 +63,7 @@ def _source(*, chat_id=CHAT, thread_id=None, chat_type="dm"):
     # parent_chat_id is a real SessionSource field; the queued-followup path reads it to pin the
     # channel inputs, so the stub carries it like every real source does.
     return SimpleNamespace(platform=Platform.TELEGRAM, chat_id=chat_id, thread_id=thread_id,
-                           chat_type=chat_type, parent_chat_id=None)
+                           chat_type=chat_type, parent_chat_id=None, profile=None, scope_id=None)
 
 
 def _telegram_adapter(send_result=None):

@@ -567,13 +567,16 @@ def format_steer_marker(steer_text: str) -> str:
 STEER_DISPLAY_KIND = "steer"
 
 
-def steer_user_row(steer_text: str) -> Dict[str, Any]:
+def steer_user_row(steer_text: str, *, input_owner: Optional[str] = None) -> Dict[str, Any]:
     """The standalone ``role:user`` row a mid-turn /steer is delivered as (after the newest tool
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
     never merges the next real prompt into it and history renderers can label it."""
-    return {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
-            "display_kind": STEER_DISPLAY_KIND}
+    row = {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
+           "display_kind": STEER_DISPLAY_KIND}
+    if input_owner:
+        row["display_metadata"] = {"gateway_input_owner": input_owner}
+    return row
 
 
 STEER_CHANNEL_NOTE = (

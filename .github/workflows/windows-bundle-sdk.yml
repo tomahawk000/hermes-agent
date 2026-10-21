@@ -20,16 +20,19 @@ permissions:
 concurrency:
   group: windows-bundle-sdk-${{ github.ref }}
   cancel-in-progress: true
+# Organization-specific larger runner labels are available upstream only.
+# Forks retain every native platform/architecture check on standard runners.
 jobs:
   windows-bundle-tools:
-    name: Cold Windows SDK (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    name: Cold Windows SDK (arm64, ${{ matrix.replica }})
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
     # Cold ARM64 npm extraction alone can exceed 15 minutes on the hosted runner.
-    timeout-minutes: 45
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 45 || 120 }}
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-latest-32-arm-core, windows-latest-32-arm-core]
+        # Preserve both cold ARM64 runs without an invalid duplicate matrix value.
+        replica: [first, second]
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:

@@ -4887,6 +4887,12 @@ Write only the summary body. Do not include any preamble or prefix."""
             replay = {"role": "user", "content": task_text}
         else:
             replay = _fresh_compaction_message_copy(inflight)
+        pending_meta = inflight.get("display_metadata") or {}
+        if pending_meta.get("codex_auth_pending") is True:
+            replay["display_metadata"] = {
+                **(replay.get("display_metadata") or {}), "codex_auth_pending": True,
+                "gateway_input_owner": pending_meta.get("gateway_input_owner"),
+            }
         replay.pop(_COMPACTION_TAIL_MARKER, None)
         # A restated row is NEW at the compaction boundary: never persist the
         # in-flight turn's original timestamp, or timestamp-ordered views show
@@ -4920,6 +4926,11 @@ Write only the summary body. Do not include any preamble or prefix."""
                 "\n\n" + _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text,
             )
             drop_stale_api_content(carrier)
+            if pending_meta.get("codex_auth_pending") is True:
+                carrier["display_metadata"] = {
+                    **(carrier.get("display_metadata") or {}), "codex_auth_pending": True,
+                    "gateway_input_owner": pending_meta.get("gateway_input_owner"),
+                }
             # The carrier absorbed a durable user turn: record its uid (merge witness).
             from agent.message_metadata import record_absorbed_message
 
@@ -5583,7 +5594,7 @@ def is_compaction_summary_message(message: Any) -> bool:
 
 # Display metadata that survives projection; other metadata may describe synthetic events and must
 # not look human.
-SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions",)
+SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions", "gateway_input_owner", "codex_auth_pending", "codex_auth_failure", "gateway_input_outcome")
 
 
 def _handoff_only_content(content: Any) -> Any:

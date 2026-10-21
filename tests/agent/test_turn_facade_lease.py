@@ -22,6 +22,9 @@ class _Db:
         self.events.append(("acquire", session_id, holder))
         return self.acquired
 
+    def read_turn_admission(self, session_id, holder, **kwargs):
+        return session_id, None, self.exists
+
     def refresh_session_turn_lease(self, session_id, holder, **kwargs):
         return True
 

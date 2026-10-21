@@ -180,6 +180,10 @@ def build_error_surface_from_result(result: Any, provider: str = "", model: str 
             if message := str(free_tier.get("message") or ""):
                 surface["message"] = message
             return surface
+        if isinstance(auth_failure := result.get("auth_failure"), dict) and auth_failure.get("provider") == "openai-codex":
+            surface = _surface(LAYER_AUTH, "codex_" + auth_failure["kind"], False, "openai-codex", model)
+            surface["recovery"] = auth_failure
+            return surface
         if not reason:  # failed result without a classified reason (legacy paths)
             drop = _looks_like_stream_drop(error_text)
             return _surface(LAYER_STREAMING if drop else LAYER_PROVIDER, "stream_drop" if drop else "unknown", True, provider, model)
