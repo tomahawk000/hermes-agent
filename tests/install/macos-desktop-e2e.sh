@@ -258,10 +258,12 @@ phase_install() {
       const app = apps.objectAtIndex(i);
       if (app.executableURL && ObjC.unwrap(app.executableURL.path) === args[0]) {
         if (!app.terminate) throw new Error("normal Quit refused");
-        // A historical app (v2026.7.1) that the bootstrap launched moments ago
-        // was seen not to finish quitting within 30s while its backend was
-        // still starting. Allow longer, but the quit must stay the normal one.
-        const deadline = Date.now() + 120000;
+        // A historical app that the bootstrap launched moments ago was seen
+        // not to finish quitting within 30s while its backend was still
+        // starting; 120s hit the same wall on run 39741699817 (v2026.9.24 ->
+        // HEAD, dmg leg, backend still warming on a shared runner). Allow
+        // longer, but the quit must stay the normal one.
+        const deadline = Date.now() + 300000;
         while (!app.terminated && Date.now() < deadline) delay(0.2);
         if (!app.terminated) throw new Error("installed app did not quit normally");
       }
@@ -276,12 +278,16 @@ run_playwright_update() {
   local rc=0
   accept_installer_marker "$INSTALL_DIR" \
     || fail "installed source has changes other than the generated install marker"
+  # 30 min, not the 10 min default: the app-driven update can run the
+  # historical venv->PM takeover plus a full Desktop rebuild, which exceeds
+  # 10 min on slower runners (same fix as windows-e2e.ps1 and
+  # installer-script-e2e.sh; see run 39661774896).
   (cd "$WORK_ROOT" && "$HERMES_E2E_NODE" "$ASSETS/launch-from-spec.mjs" \
     --spec "$spec" \
     --old-sha "$OLD_SHA" --chat-out "$LOG_DIR/update-window" --mock-url "$HERMES_E2E_MOCK_URL" \
     --result "$HERMES_HOME/.hermes-update-result.json" \
     --expect-sha "$TARGET_SHA" \
-    --repo-dir "$INSTALL_DIR" 2>&1 \
+    --repo-dir "$INSTALL_DIR" --timeout-ms 1800000 2>&1 \
     | ts_prefix > "$LOG_DIR/app-update.log") || rc=$?
   log_group "app update (Playwright) transcript" "$LOG_DIR/app-update.log"
   [ "$rc" -eq 0 ] || fail "app-driven update exited $rc; transcript above"
