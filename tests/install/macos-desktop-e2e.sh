@@ -258,10 +258,12 @@ phase_install() {
       const app = apps.objectAtIndex(i);
       if (app.executableURL && ObjC.unwrap(app.executableURL.path) === args[0]) {
         if (!app.terminate) throw new Error("normal Quit refused");
-        // A historical app (v2026.7.1) that the bootstrap launched moments ago
-        // was seen not to finish quitting within 30s while its backend was
-        // still starting. Allow longer, but the quit must stay the normal one.
-        const deadline = Date.now() + 120000;
+        // A historical app that the bootstrap launched moments ago was seen
+        // not to finish quitting within 30s while its backend was still
+        // starting; 120s hit the same wall on run 39741699817 (v2026.9.24 ->
+        // HEAD, dmg leg, backend still warming on a shared runner). Allow
+        // longer, but the quit must stay the normal one.
+        const deadline = Date.now() + 300000;
         while (!app.terminated && Date.now() < deadline) delay(0.2);
         if (!app.terminated) throw new Error("installed app did not quit normally");
       }
