@@ -81,6 +81,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
                                           base_url_override="https://api.tokenfactory.nebius.com/v1",
                                           base_url_env_var="NEBIUS_BASE_URL"),
     "ollama-cloud": HermesOverlay(base_url_override="https://ollama.com/v1", base_url_env_var="OLLAMA_BASE_URL"),
+    # models.dev added a "commandcode" catalog entry whose env naming (CMD_API_KEY)
+    # diverges from the plugin profile's COMMANDCODE_* contract that config_defaults,
+    # doctor, dump and the picker all standardize on. The overlay reconciles the
+    # models.dev rung with the plugin profile so credential checks accept both.
+    "commandcode": HermesOverlay(extra_env_vars=("COMMANDCODE_API_KEY",),
+                                 base_url_env_var="COMMANDCODE_BASE_URL"),
     # Azure Foundry serves OpenAI- and Anthropic-style endpoints; transport comes from model.api_mode.
     "azure-foundry": HermesOverlay(base_url_env_var="AZURE_FOUNDRY_BASE_URL"),
     "bedrock": HermesOverlay(transport="bedrock_converse", auth_type="aws_sdk"),
