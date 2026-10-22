@@ -67,7 +67,15 @@ from tests.fakes.fake_llm_provider import write_hermes_home
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 OPT_IN_ENV = "HERMES_E2E_WINDOWS_INSTALL"
-INSTALL_TIMEOUT = 1500.0
+# 1500s was sized for a quiet runner. On a loaded shared windows-latest runner the npm
+# tool's unpack alone ran 357-510s and the cold `npm ci` over the ui-tui/web workspaces
+# ("Preparing Node dependencies", started at ~831s) was still going when the cap fired
+# (run 39830862340, 13 tests lost to 'install did not finish within 1500s'); the same
+# commit passed 12h earlier (run 39741186229), so this is wall-clock drift, not a
+# regression. 2100s covers the observed pre-npm worst case (~900s) plus a ~20-min cold
+# npm ci with margin, and stays under the suite's per-file budget (3600s, set in
+# .github/workflows/windows-install-update-e2e.yml) with room for the update + turns.
+INSTALL_TIMEOUT = 2100.0
 UPDATE_TIMEOUT = 1200.0
 CMD_TIMEOUT = 300.0
 GATEWAY_READY_TIMEOUT = 240.0
