@@ -497,12 +497,16 @@ case "$UPDATE_METHOD" in
     step "driving the app under Playwright: Settings -> About -> Update now"
     # Use the checkout module closure and current driver Node, not OLD tooling.
     rc=0
+    # 30 min, not the 10 min default: like the Windows driver, the app-driven
+    # update can run the historical venv->PM takeover plus a full Desktop
+    # rebuild (9m43s measured on Windows; a macos HEAD->NEXT leg timed out at
+    # 10 min with the rebuild still packaging - run 39661774896).
     (cd "$WORK_ROOT" && "$HERMES_E2E_NODE" "$ASSETS/launch-from-spec.mjs" \
       --spec "$SPEC" \
       --old-sha "$OLD_SHA" --chat-out "$LOG_DIR/update-window" --mock-url "$HERMES_E2E_MOCK_URL" \
       --result "$HERMES_HOME/.hermes-update-result.json" \
       --expect-sha "$TARGET_SHA" \
-      --repo-dir "$INSTALL_DIR" 2>&1 \
+      --repo-dir "$INSTALL_DIR" --timeout-ms 1800000 2>&1 \
       | ts_prefix > "$LOG_DIR/app-update.log") || rc=$?
     log_group "app update (Playwright) transcript" "$LOG_DIR/app-update.log"
     # Evidence before the assertion: the hand-off transcript is exactly what a

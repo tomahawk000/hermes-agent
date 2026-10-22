@@ -276,12 +276,16 @@ run_playwright_update() {
   local rc=0
   accept_installer_marker "$INSTALL_DIR" \
     || fail "installed source has changes other than the generated install marker"
+  # 30 min, not the 10 min default: the app-driven update can run the
+  # historical venv->PM takeover plus a full Desktop rebuild, which exceeds
+  # 10 min on slower runners (same fix as windows-e2e.ps1 and
+  # installer-script-e2e.sh; see run 39661774896).
   (cd "$WORK_ROOT" && "$HERMES_E2E_NODE" "$ASSETS/launch-from-spec.mjs" \
     --spec "$spec" \
     --old-sha "$OLD_SHA" --chat-out "$LOG_DIR/update-window" --mock-url "$HERMES_E2E_MOCK_URL" \
     --result "$HERMES_HOME/.hermes-update-result.json" \
     --expect-sha "$TARGET_SHA" \
-    --repo-dir "$INSTALL_DIR" 2>&1 \
+    --repo-dir "$INSTALL_DIR" --timeout-ms 1800000 2>&1 \
     | ts_prefix > "$LOG_DIR/app-update.log") || rc=$?
   log_group "app update (Playwright) transcript" "$LOG_DIR/app-update.log"
   [ "$rc" -eq 0 ] || fail "app-driven update exited $rc; transcript above"
