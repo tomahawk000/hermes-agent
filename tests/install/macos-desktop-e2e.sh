@@ -258,13 +258,16 @@ phase_install() {
       const app = apps.objectAtIndex(i);
       if (app.executableURL && ObjC.unwrap(app.executableURL.path) === args[0]) {
         if (!app.terminate) throw new Error("normal Quit refused");
-        // A historical app that the bootstrap launched moments ago was seen
-        // not to finish quitting within 30s while its backend was still
-        // starting; 120s hit the same wall on run 39741699817 (v2026.9.24 ->
-        // HEAD, dmg leg, backend still warming on a shared runner). Allow
-        // longer, but the quit must stay the normal one.
+        // AppKit updates `terminated` only from the run loop, and delay()
+        // does not run it, so the poll could read stale `false` forever after
+        // the app had actually quit (-2700 on runs 39741699817 and
+        // 39918872227; upstream f7154b0764 root-caused the same class). Spin
+        // the run loop while waiting. The quit stays the normal one; the
+        // 300s bound stays for shared-runner drift.
         const deadline = Date.now() + 300000;
-        while (!app.terminated && Date.now() < deadline) delay(0.2);
+        while (!app.terminated && Date.now() < deadline) {
+          $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+        }
         if (!app.terminated) throw new Error("installed app did not quit normally");
       }
     }
