@@ -65,7 +65,10 @@ jobs:
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
           HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '6' || '2' }}
-          HERMES_TEST_FILE_TIMEOUT: '2400'
+          # One file = one install -> update -> turns journey. Must clear INSTALL_TIMEOUT
+          # (2100s, tests/e2e/core/windows_update/_machine.py) plus the update and turn tail
+          # with margin, or a merely-slow install converts into a file-timeout failure.
+          HERMES_TEST_FILE_TIMEOUT: '3600'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
