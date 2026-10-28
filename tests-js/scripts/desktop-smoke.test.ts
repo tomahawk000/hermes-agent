@@ -4,9 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 
 import yaml from 'js-yaml'
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 
-import { candidateSmokeHermesHomes, predictSmokeHermesHome, resolveSmokeLaunch, runInstalledDesktopSmoke, smokeEnvironment } from '../../tests/install/e2e-assets/desktop-smoke.ts'
+import { candidateSmokeHermesHomes, GRACEFUL_CLOSE_TIMEOUT_MS, gracefulClose, predictSmokeHermesHome, resolveSmokeLaunch, runInstalledDesktopSmoke, smokeEnvironment } from '../../tests/install/e2e-assets/desktop-smoke.ts'
 import { sourceRuntimeSettleCommand } from '../../tests/install/e2e-assets/source-runtime-settle.mjs'
 import { assertUpdateWindowBackendOrigin, assertUpdateWindowProcess } from '../../tests/install/e2e-assets/update-window-chat.mjs'
 
@@ -599,4 +599,34 @@ test('re-writing the same provider config is byte-identical', (): void => {
       'OPENAI_BASE_URL=http://127.0.0.1:9000/v1\n# keep me\nOTHER_TEST_VALUE=kept\n'
       + 'MOCK_API_KEY=e2e-mock-key\nOPENAI_API_KEY=e2e-mock-key\n')
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
+})
+
+test('gracefulClose tolerates a close that outlasts the historical 20s bound', async (): Promise<void> => {
+  // Run 40649904203 failed the dmg update leg when the app took ~22s to quit
+  // on a lagged shared runner: the old 20s bound rejected, then the app
+  // exited ~2s later. The bound must leave room for the before-quit teardown
+  // coordinator on such runners, like process-close.cjs's 120s.
+  vi.useFakeTimers()
+
+  try {
+    const app = { close: (): Promise<void> => new Promise<void>((resolve): void => { setTimeout(resolve, 60_000) }) }
+    const closed = gracefulClose(app as never)
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await expect(closed).resolves.toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+  } finally { vi.useRealTimers() }
+})
+
+test('gracefulClose still rejects a close that never lands', async (): Promise<void> => {
+  vi.useFakeTimers()
+
+  try {
+    const app = { close: (): Promise<void> => new Promise<void>((): void => {}) }
+    const assertion = expect(gracefulClose(app as never)).rejects.toThrow('Desktop did not close gracefully')
+
+    await vi.advanceTimersByTimeAsync(GRACEFUL_CLOSE_TIMEOUT_MS)
+    await assertion
+    expect(vi.getTimerCount()).toBe(0)
+  } finally { vi.useRealTimers() }
 })
