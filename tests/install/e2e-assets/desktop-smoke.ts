@@ -217,11 +217,21 @@ export function settleSourceDesktopRuntime(options: SmokeOptions, launch: Launch
   }
 }
 
-async function gracefulClose(app: ElectronApplication): Promise<void> {
+// Playwright's app.close() resolves only after the Electron main process has
+// fully exited, and this app's quit runs the before-quit teardown coordinator
+// (backend SIGTERM join, SSH teardown) first. On a loaded shared runner that
+// can outlast a short bound without anything being wrong: run 40649904203
+// (2026-10-28) logged 5.4s of main-process event-loop lag, the 20s bound here
+// rejected, and the app then exited ~2s later — the leg failed on a quit that
+// had already succeeded. Match the 120s the sibling process-close.cjs allows
+// for the same class of close.
+export const GRACEFUL_CLOSE_TIMEOUT_MS = 120_000
+
+export async function gracefulClose(app: ElectronApplication): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     await Promise.race([app.close(), new Promise<never>((_resolve, reject): void => {
-      timer = setTimeout((): void => reject(new Error('Desktop did not close gracefully')), 20_000)
+      timer = setTimeout((): void => reject(new Error('Desktop did not close gracefully')), GRACEFUL_CLOSE_TIMEOUT_MS)
     })])
   } finally {
     clearTimeout(timer)
