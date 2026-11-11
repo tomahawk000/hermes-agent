@@ -33,8 +33,15 @@ that contract (nothing deleted or modified, additions tolerated) is already
 enforced separately, so this tool does not double-own them.
 
 Unreadable paths are a hard error (exit 2), never a silent skip: a scanner that
-cannot see a file cannot defend it. An empty snapshot is refused as
-inconclusive (exit 3) rather than reported as a pass.
+cannot see a file cannot defend it. TRANSIENT unreadability is different: the
+verify runs seconds after an upgrade rewrote the tree, while the relaunched
+desktop app, Windows Defender, or the search indexer can still hold a file. A
+permission/lock error that clears on its own within a few seconds is retried
+(USER_STATE_SCAN_RETRIES attempts, USER_STATE_SCAN_RETRY_DELAY seconds apart)
+before it is allowed to fail the leg; a persistent one still exits 2, and a
+real state difference (exit 1) is never retried.
+An empty snapshot is refused as inconclusive (exit 3) rather than reported as a
+pass.
 
 Usage:
   python verify-user-state.py snapshot --home <HERMES_HOME> --out snap.json
@@ -51,6 +58,7 @@ import os
 import sqlite3
 import stat
 import sys
+import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -85,6 +93,21 @@ COUNTED_TABLES = ("sessions", "messages", "usage", "cron_jobs")
 
 class ScanError(Exception):
     pass
+
+
+def _describe_scan_error(exc: Exception | None) -> str:
+    """Name the path a scan failure hit, when the exception carries one.
+
+    A bare "[Errno 13] Permission denied" on a Windows runner left a whole leg
+    undiagnosable (the OSError arrived with no filename). Filename-bearing or
+    not, the message here always says as much as the exception knows.
+    """
+    if exc is None:
+        return "unknown scan error"
+    filename = getattr(exc, "filename", None)
+    if filename:
+        return f"{exc} [path: {filename}]"
+    return str(exc)
 
 
 def _sha256_file(path: str) -> str:
@@ -614,10 +637,28 @@ def main(argv: list[str] | None = None) -> int:
         snap = json.load(handle)
     if args.profiles_dir:
         snap["_profiles_dir"] = args.profiles_dir
-    try:
-        report = verify_home(args.home, snap)
-    except (OSError, ScanError) as exc:
-        print(f"verify failed: {exc}", file=sys.stderr)
+    # The verify re-walks the home seconds after the upgrade rewrote it, with
+    # the relaunched app (and on Windows, Defender / the search indexer) still
+    # touching those files: a transient lock is atmosphere, not a lost file.
+    # Retry scan-level failures a few times; only a persistent one exits 2.
+    attempts = int(os.environ.get("USER_STATE_SCAN_RETRIES", "4"))
+    delay = float(os.environ.get("USER_STATE_SCAN_RETRY_DELAY", "10"))
+    report = None
+    exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            report = verify_home(args.home, snap)
+            exc = None
+            break
+        except (OSError, ScanError) as err:
+            exc = err
+            if attempt < attempts:
+                print(f"verify scan attempt {attempt}/{attempts} hit a transient "
+                      f"read error ({_describe_scan_error(err)}); retrying in "
+                      f"{delay:g}s", file=sys.stderr)
+                time.sleep(delay)
+    if exc is not None or report is None:
+        print(f"verify failed: {_describe_scan_error(exc)}", file=sys.stderr)
         return 2
 
     rendered = json.dumps(report, indent=2, sort_keys=True)
