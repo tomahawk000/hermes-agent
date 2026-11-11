@@ -491,3 +491,90 @@ def test_a_retired_var_removed_outright_still_fails(tmp_path):
 
     assert report["ok"] is False
     assert report["modified"][".env"]["key_diff"]["keys_removed"] == ["LLM_MODEL"]
+
+
+# --- transient scan-error retries (verify mode) ------------------------------
+#
+# The install/update E2E legs re-walk the home seconds after the upgrade
+# rewrote it, while the relaunched app (and on Windows, Defender / the search
+# indexer) can still hold a file. A scan-level error that clears on its own is
+# retried; a persistent one still exits 2; a real state difference (exit 1) is
+# never retried.
+
+
+def _snap_file(tmp_path, home):
+    out = tmp_path / "snap.json"
+    rc = vus.main(["snapshot", "--home", str(home), "--out", str(out)])
+    assert rc == 0
+    return out
+
+
+def test_verify_retries_a_transient_scan_error(tmp_path, monkeypatch):
+    """The 2026-11-10 Windows flake: Errno 13 mid-verify must not fail the leg
+    when the very next read succeeds."""
+    monkeypatch.setenv("USER_STATE_SCAN_RETRY_DELAY", "0")
+    home = _home(tmp_path)
+    snap_path = _snap_file(tmp_path, home)
+
+    real_verify = vus.verify_home
+    calls = {"n": 0}
+
+    def flaky_verify(h, snap):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied")
+        return real_verify(h, snap)
+
+
+    monkeypatch.setattr(vus, "verify_home", flaky_verify)
+    rc = vus.main(["verify", "--home", str(home), "--snapshot", str(snap_path)])
+
+    assert rc == 0
+    assert calls["n"] == 2
+
+
+def test_verify_still_exits_2_on_a_persistent_scan_error(tmp_path, monkeypatch):
+    """Retry tolerance is for transients only: a scanner that can never see the
+    home still cannot claim preservation."""
+    monkeypatch.setenv("USER_STATE_SCAN_RETRIES", "3")
+    monkeypatch.setenv("USER_STATE_SCAN_RETRY_DELAY", "0")
+    home = _home(tmp_path)
+    snap_path = _snap_file(tmp_path, home)
+
+    calls = {"n": 0}
+
+    def always_broken(h, snap):
+        calls["n"] += 1
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(vus, "verify_home", always_broken)
+    rc = vus.main(["verify", "--home", str(home), "--snapshot", str(snap_path)])
+
+    assert rc == 2
+    assert calls["n"] == 3
+
+
+def test_verify_never_retries_a_real_state_difference(tmp_path, monkeypatch):
+    """Exit 1 (the upgrade actually took something) fails on the first pass."""
+    monkeypatch.setenv("USER_STATE_SCAN_RETRY_DELAY", "0")
+    home = _home(tmp_path)
+    snap_path = _snap_file(tmp_path, home)
+
+    calls = {"n": 0}
+
+    def lost_state(h, snap):
+        calls["n"] += 1
+        return {"schema": 1, "home": str(h), "counts": {"before": 1, "after": 0,
+                "deleted": 1, "modified": 0, "added": 0, "tolerated_modified": 0,
+                "tolerated_deleted": 0, "advisory_changed": 0},
+                "deleted": ["memories/note.md"], "tolerated_deleted": [],
+                "modified": {}, "added": [], "tolerated_modified": [],
+                "retired_env_cleared": {}, "rows_shrank": [],
+                "advisory": {"deleted": [], "modified": {}, "added": []},
+                "ok": False}
+
+    monkeypatch.setattr(vus, "verify_home", lost_state)
+    rc = vus.main(["verify", "--home", str(home), "--snapshot", str(snap_path)])
+
+    assert rc == 1
+    assert calls["n"] == 1
