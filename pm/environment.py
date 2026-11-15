@@ -73,6 +73,51 @@ def classify_uv_failure(stage: str, returncode: int, output: str) -> InstallErro
     return InstallError("venv", cause)
 
 
+# A failed fetch/download (DNS blip, connection reset, an index hiccup) is
+# transient on a healthy network: CI runners hit these mid-run with no code
+# change, and one red leg then poisons the whole install/update matrix
+# (hermes-agent #45/#46). Resolver conflicts and build-backend failures are
+# deliberately NOT here — they repeat identically and retrying them would only
+# multiply wall-clock cost.
+_TRANSIENT_FETCH_MARKERS = (
+    "dns error",
+    "failed to lookup address information",
+    "temporary failure in name resolution",
+    "error sending request for url",
+    "client error (connect)",
+    "connection reset",
+    "connection refused",
+    "network is unreachable",
+    "connection timed out",
+    "operation timed out",
+)
+
+
+def is_transient_fetch_failure(output: str) -> bool:
+    """True when a failed uv command's output shows a transient fetch error."""
+    lowered = output.lower()
+    if any(marker in lowered for marker in _RESOLVER_MARKERS):
+        return False
+    if any(marker in lowered for marker in _BUILD_MARKERS):
+        return False
+    return any(marker in lowered for marker in _TRANSIENT_FETCH_MARKERS)
+
+
+def _fetch_retries() -> int:
+    """Retries after the first failed attempt; PM_UV_FETCH_RETRIES overrides."""
+    try:
+        return max(0, int(os.environ.get("PM_UV_FETCH_RETRIES", "3")))
+    except ValueError:
+        return 3
+
+
+def _fetch_retry_delay() -> float:
+    try:
+        return max(0.0, float(os.environ.get("PM_UV_FETCH_RETRY_DELAY", "15")))
+    except ValueError:
+        return 15.0
+
+
 def _project_name(source: Path) -> str:
     """``[project].name`` of *source*'s pyproject, on any Python that can run the bootstrap.
 
@@ -323,6 +368,31 @@ class PythonEnvironment:
                 # name the mirror knobs instead of surfacing a raw TimeoutExpired.
                 raise InstallError("venv", f"uv {args[0]} timed out after {timeout}s", TIMEOUT_HINT) from exc
 
+    def _run_fetch_with_retries(self, stage: str, args: list[str], *, cwd: Path,
+                                timeout: int) -> subprocess.CompletedProcess:
+        """_run with bounded retries on transient fetch failures only.
+
+        A DNS blip or reset connection on a CI runner must not fail the whole
+        lane; a resolver conflict or build failure must not be retried. Every
+        attempt gets the full timeout, and the final failure's result is
+        returned unchanged so classification and error text stay identical.
+        """
+        attempts = 1 + _fetch_retries()
+        result = self._run(args, cwd=cwd, timeout=timeout)
+        for attempt in range(2, attempts + 1):
+            if result.returncode == 0:
+                break
+            output = result.stderr or result.stdout
+            if not is_transient_fetch_failure(output):
+                break
+            delay = _fetch_retry_delay()
+            sink = self.output if self.output is not None else sys.stderr
+            print(f"uv {stage} hit a transient fetch error; "
+                  f"retrying in {delay:g}s (attempt {attempt}/{attempts})", file=sink, flush=True)
+            time.sleep(delay)
+            result = self._run(args, cwd=cwd, timeout=timeout)
+        return result
+
     def create(self) -> None:
         """Create at the final destination; callers must not move a live venv."""
         self.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -338,13 +408,13 @@ class PythonEnvironment:
         command = ["lock", "--python", str(self.python)]
         if upgrade:
             command.append("--upgrade")
-        result = self._run(command, cwd=source, timeout=timeout)
+        result = self._run_fetch_with_retries("lock", command, cwd=source, timeout=timeout)
         if result.returncode:
             raise classify_uv_failure("lock", result.returncode, result.stderr or result.stdout)
 
     def check_lock(self, source: Path) -> None:
-        result = self._run(["lock", "--check", "--python", str(self.python)],
-                           cwd=source, timeout=1800)
+        result = self._run_fetch_with_retries(
+            "lock", ["lock", "--check", "--python", str(self.python)], cwd=source, timeout=1800)
         if result.returncode:
             raise classify_uv_failure("lock", result.returncode, result.stderr or result.stdout)
 
@@ -381,7 +451,7 @@ class PythonEnvironment:
             command += ["--extra", extra]
         for group in sorted(set(groups)):
             command += ["--group", group]
-        result = self._run(command, cwd=source, timeout=timeout)
+        result = self._run_fetch_with_retries("sync", command, cwd=source, timeout=timeout)
         if result.returncode:
             raise classify_uv_failure("sync", result.returncode, result.stderr or result.stdout)
 
@@ -412,7 +482,7 @@ class PythonEnvironment:
         if wheelhouse is not None:
             command += ["--no-index", "--only-binary", ":all:",
                         "--find-links", str(wheelhouse.absolute())]
-        result = self._run(command, cwd=requirements.parent, timeout=timeout)
+        result = self._run_fetch_with_retries("pip", command, cwd=requirements.parent, timeout=timeout)
         if result.returncode:
             raise classify_uv_failure("pip", result.returncode, result.stderr or result.stdout)
 
