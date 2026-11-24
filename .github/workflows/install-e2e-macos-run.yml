@@ -193,7 +193,7 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
           if-no-files-found: ignore
 
   # ---- arm 3: the real signed bundle pair, in-app update ------------------
@@ -281,5 +281,5 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
           if-no-files-found: ignore

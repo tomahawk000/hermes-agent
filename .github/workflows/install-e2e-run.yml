@@ -176,5 +176,5 @@ jobs:
           # times per route, and same-named artifacts collide.
           name: ${{ steps.artifact.outputs.name }}-${{ github.sha }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
           if-no-files-found: ignore

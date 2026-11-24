@@ -393,7 +393,7 @@ jobs:
           name: install-e2e-player
           path: tests/install/e2e-assets/playback.html
           archive: false
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
           if-no-files-found: error
 
   # Strict source-matrix gate (release runs). needs collapses each matrix to
