@@ -34,7 +34,13 @@ def is_transient(exc: Exception) -> bool:
     if isinstance(exc, ssl.SSLError):
         return False
     if isinstance(exc, socket.gaierror):
-        return exc.errno == socket.EAI_AGAIN
+        # EAI_AGAIN is an explicit "try again later". EAI_NONAME (the
+        # "nodename nor servname provided" symptom) is also surfaced by
+        # macOS resolvers for transient DNS outages on known-good hosts
+        # (the scheduled install/update E2E hit it for github.com), so
+        # retry it too. EAI_FAIL (the resolver itself is wedged) stays
+        # permanent so a misconfigured host still fails fast.
+        return exc.errno in (socket.EAI_AGAIN, socket.EAI_NONAME)
     if isinstance(exc, (TimeoutError, ConnectionError, http.client.IncompleteRead)):
         return True
     return isinstance(exc, OSError) and exc.errno in _NETWORK_ERRNOS
