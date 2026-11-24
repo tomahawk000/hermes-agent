@@ -158,7 +158,7 @@ jobs:
             ${{ runner.temp }}/hermes-bundled-update/home/logs/
             ${{ runner.temp }}/hermes-bundled-update-recording.mkv
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
   e2e:
     # Short static name on purpose: name expressions render UNEXPANDED on
     # skipped jobs.
@@ -285,7 +285,7 @@ jobs:
           name: install-e2e-known-${{ steps.update.outputs.known_failure }}--${{ inputs.leg-id }}
           path: gui-e2e-proof/known-failure.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
 
       - name: Stop screen recording
         if: always()
@@ -327,5 +327,5 @@ jobs:
         with:
           name: install-e2e-logs-${{ inputs.leg-id }}
           path: gui-e2e-proof
-          retention-days: 14
+          retention-days: ${{ github.repository == 'tomahawk000/hermes-agent' && 3 || 14 }}
           if-no-files-found: ignore
