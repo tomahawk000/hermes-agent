@@ -116,9 +116,7 @@ on:
         required: false
         type: string
         default: ''
-  schedule:
-    # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
-    - cron: '20 7,19 * * *'
+  # This fork runs the install matrix on relevant PRs or by request, not on a timer.
   pull_request:
     # The install/update surface: derived from 60 days of commits whose subject
     # names update/install/pm/bootstrap/relaunch. Keep it to code a real
